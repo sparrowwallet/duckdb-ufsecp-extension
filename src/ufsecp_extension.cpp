@@ -100,6 +100,126 @@ static int64_t ExtractUpper64(const FieldElement &fe) {
 }
 
 // ============================================================================
+// Point decompression — 33-byte SEC1 compressed → Point
+// ============================================================================
+
+// Decompress a 33-byte SEC1 compressed public key to a Point.
+// Returns Point::infinity() on invalid input.
+static Point PointFromCompressed(const uint8_t *pub33) {
+	if (pub33[0] != 0x02 && pub33[0] != 0x03) {
+		return Point::infinity();
+	}
+
+	FieldElement x;
+	if (!FieldElement::parse_bytes_strict(pub33 + 1, x)) {
+		return Point::infinity();
+	}
+
+	// y² = x³ + 7
+	auto x2 = x * x;
+	auto x3 = x2 * x;
+	auto y2 = x3 + FieldElement::from_uint64(7);
+
+	// sqrt via addition chain for (p+1)/4
+	auto t = y2;
+	auto a = t.square() * t;
+	auto b = a.square() * t;
+	auto c = b.square().square().square() * b;
+	auto d = c.square().square().square() * b;
+	auto e = d.square().square() * a;
+	auto f = e;
+	for (int i = 0; i < 11; ++i)
+		f = f.square();
+	f = f * e;
+	auto g = f;
+	for (int i = 0; i < 22; ++i)
+		g = g.square();
+	g = g * f;
+	auto h = g;
+	for (int i = 0; i < 44; ++i)
+		h = h.square();
+	h = h * g;
+	auto j = h;
+	for (int i = 0; i < 88; ++i)
+		j = j.square();
+	j = j * h;
+	auto k = j;
+	for (int i = 0; i < 44; ++i)
+		k = k.square();
+	k = k * g;
+	auto m = k.square().square().square() * b;
+	auto y = m;
+	for (int i = 0; i < 23; ++i)
+		y = y.square();
+	y = y * f;
+	for (int i = 0; i < 6; ++i)
+		y = y.square();
+	y = y * a;
+	y = y.square().square();
+
+	// Verify sqrt is correct (reject points not on the curve)
+	if (!(y * y == y2)) {
+		return Point::infinity();
+	}
+
+	// Fix parity
+	auto y_bytes = y.to_bytes();
+	bool y_is_odd = (y_bytes[31] & 1) != 0;
+	bool want_odd = (pub33[0] == 0x03);
+	if (y_is_odd != want_odd) {
+		y = FieldElement::from_uint64(0) - y;
+	}
+
+	return Point::from_affine(x, y);
+}
+
+// ============================================================================
+// Pubkey parsing — handles both 33-byte compressed and 64-byte LE raw formats
+// ============================================================================
+
+static bool ParsePubkey(const uint8_t *data, idx_t size, Point &out) {
+	if (size == 64) {
+		// 64-byte: little-endian x || little-endian y (Frigate wire format)
+		FieldElement x = FieldElementFromLE(data);
+		FieldElement y = FieldElementFromLE(data + 32);
+		out = Point::from_affine(x, y);
+		return true;
+	} else if (size == 33) {
+		// 33-byte: SEC1 compressed
+		out = PointFromCompressed(data);
+		return !out.is_infinity();
+	}
+	return false;
+}
+
+// ============================================================================
+// KPlan + midstate cache for scan_silent_payments scalar function
+// ============================================================================
+
+// The scan_private_key is constant across all rows in a query. Cache the
+// expensive KPlan precomputation (GLV decomposition + wNAF encoding).
+static std::mutex g_ssp_cache_mutex;
+static std::array<uint8_t, 32> g_ssp_cached_key = {};
+static KPlan g_ssp_cached_kplan;
+static secp256k1::SHA256 g_ssp_tag_midstate;
+static bool g_ssp_cache_initialized = false;
+
+static const KPlan &GetCachedKPlan(const uint8_t *scan_key_be) {
+	std::lock_guard<std::mutex> lock(g_ssp_cache_mutex);
+	if (g_ssp_cache_initialized && std::memcmp(scan_key_be, g_ssp_cached_key.data(), 32) == 0) {
+		return g_ssp_cached_kplan;
+	}
+	std::memcpy(g_ssp_cached_key.data(), scan_key_be, 32);
+	Scalar scan_scalar = Scalar::from_bytes(scan_key_be);
+	g_ssp_cached_kplan = KPlan::from_scalar(scan_scalar);
+	if (!g_ssp_cache_initialized) {
+		g_ssp_tag_midstate = secp256k1::detail::make_tag_midstate("BIP0352/SharedSecret");
+		g_ssp_cache_initialized = true;
+	}
+	return g_ssp_cached_kplan;
+}
+
+// ============================================================================
 // Bind data — precomputed query constants
 // ============================================================================
 
@@ -813,6 +933,162 @@ static OperatorFinalizeResultType UfsecpScanFinalFunction(ExecutionContext &cont
 }
 
 // ============================================================================
+// scan_silent_payments — per-row BIP-352 scanning (drop-in for secp256k1 ext)
+// ============================================================================
+//
+// Signature: scan_silent_payments(outputs LIST[BIGINT], keys LIST[BLOB],
+//                                  label_tweaks LIST[BLOB]) -> BOOLEAN
+//
+// keys[0] = 32-byte scan private key (big-endian)
+// keys[1] = 33-byte compressed or 64-byte LE raw spend public key
+// keys[2] = 33-byte compressed or 64-byte LE raw tweak key (per-row)
+//
+
+inline void ScanSilentPaymentsScalarFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	D_ASSERT(args.ColumnCount() == 3);
+
+	TernaryExecutor::ExecuteWithNulls<list_entry_t, list_entry_t, list_entry_t, bool>(
+	    args.data[0], args.data[1], args.data[2], result, args.size(),
+	    [&](list_entry_t outputs_list, list_entry_t keys_list, list_entry_t label_tweaks_list, ValidityMask &mask,
+	        idx_t idx) {
+		    auto &outputs_child = ListVector::GetEntry(args.data[0]);
+		    auto &keys_child = ListVector::GetEntry(args.data[1]);
+		    auto &label_tweaks_child = ListVector::GetEntry(args.data[2]);
+
+		    // --- Validate keys list has exactly 3 elements ---
+		    if (keys_list.length != 3) {
+			    mask.SetInvalid(idx);
+			    return false;
+		    }
+
+		    idx_t scan_key_idx = keys_list.offset;
+		    idx_t spend_key_idx = keys_list.offset + 1;
+		    idx_t tweak_key_idx = keys_list.offset + 2;
+
+		    if (FlatVector::IsNull(keys_child, scan_key_idx) || FlatVector::IsNull(keys_child, spend_key_idx) ||
+		        FlatVector::IsNull(keys_child, tweak_key_idx)) {
+			    mask.SetInvalid(idx);
+			    return false;
+		    }
+
+		    auto scan_key_blob = FlatVector::GetData<string_t>(keys_child)[scan_key_idx];
+		    auto spend_key_blob = FlatVector::GetData<string_t>(keys_child)[spend_key_idx];
+		    auto tweak_key_blob = FlatVector::GetData<string_t>(keys_child)[tweak_key_idx];
+
+		    // --- Validate sizes ---
+		    if (scan_key_blob.GetSize() != 32) {
+			    mask.SetInvalid(idx);
+			    return false;
+		    }
+		    if (spend_key_blob.GetSize() != 33 && spend_key_blob.GetSize() != 64) {
+			    mask.SetInvalid(idx);
+			    return false;
+		    }
+		    if (tweak_key_blob.GetSize() != 33 && tweak_key_blob.GetSize() != 64) {
+			    mask.SetInvalid(idx);
+			    return false;
+		    }
+
+		    // --- Parse scan private key (32 bytes, big-endian) ---
+		    const uint8_t *scan_key_data = reinterpret_cast<const uint8_t *>(scan_key_blob.GetData());
+		    const KPlan &kplan = GetCachedKPlan(scan_key_data);
+
+		    // --- Parse spend public key ---
+		    Point spend_point;
+		    if (!ParsePubkey(reinterpret_cast<const uint8_t *>(spend_key_blob.GetData()), spend_key_blob.GetSize(),
+		                     spend_point)) {
+			    mask.SetInvalid(idx);
+			    return false;
+		    }
+
+		    // --- Parse tweak key ---
+		    Point tweak_point;
+		    if (!ParsePubkey(reinterpret_cast<const uint8_t *>(tweak_key_blob.GetData()), tweak_key_blob.GetSize(),
+		                     tweak_point)) {
+			    mask.SetInvalid(idx);
+			    return false;
+		    }
+
+		    // === BIP-352 Pipeline ===
+
+		    // Step 1: shared_secret = tweak_key × scan_private_key
+		    Point shared_secret = tweak_point.scalar_mul_with_plan(kplan);
+
+		    // Step 2: Serialize to 33-byte compressed SEC1 + 4 zero bytes (k=0)
+		    auto compressed = shared_secret.to_compressed();
+		    uint8_t serialized[37];
+		    std::memcpy(serialized, compressed.data(), 33);
+		    std::memset(serialized + 33, 0, 4);
+
+		    // Step 3: Tagged hash with cached midstate
+		    auto hash = secp256k1::detail::cached_tagged_hash(g_ssp_tag_midstate, serialized, 37);
+
+		    // Step 4: output_point = hash × G
+		    Scalar hash_scalar = Scalar::from_bytes(hash.data());
+		    Point output_point = Point::generator().scalar_mul(hash_scalar);
+
+		    // Step 5: candidate = spend_pubkey + output_point
+		    Point candidate = spend_point.add(output_point);
+
+		    // Step 6: Serialize and extract upper 64 bits for matching
+		    auto candidate_compressed = candidate.to_compressed();
+		    int64_t candidate_prefix = 0;
+		    const uint8_t *cx = candidate_compressed.data() + 1; // skip prefix byte
+		    for (int i = 0; i < 8; i++) {
+			    candidate_prefix = (candidate_prefix << 8) | cx[i];
+		    }
+
+		    // Step 7: Check direct match against outputs
+		    for (idx_t j = 0; j < outputs_list.length; j++) {
+			    idx_t output_idx = outputs_list.offset + j;
+			    if (FlatVector::IsNull(outputs_child, output_idx))
+				    continue;
+			    auto output_val = FlatVector::GetData<int64_t>(outputs_child)[output_idx];
+			    if (output_val == candidate_prefix) {
+				    return true;
+			    }
+		    }
+
+		    // Step 8: Label iteration
+		    for (idx_t lbl = 0; lbl < label_tweaks_list.length; lbl++) {
+			    idx_t label_idx = label_tweaks_list.offset + lbl;
+			    if (FlatVector::IsNull(label_tweaks_child, label_idx))
+				    continue;
+
+			    auto label_blob = FlatVector::GetData<string_t>(label_tweaks_child)[label_idx];
+			    if (label_blob.GetSize() != 33 && label_blob.GetSize() != 64)
+				    continue;
+
+			    Point label_point;
+			    if (!ParsePubkey(reinterpret_cast<const uint8_t *>(label_blob.GetData()), label_blob.GetSize(),
+			                     label_point)) {
+				    continue;
+			    }
+
+			    Point tweaked = candidate.add(label_point);
+			    auto tweaked_compressed = tweaked.to_compressed();
+			    int64_t tweaked_prefix = 0;
+			    const uint8_t *tx = tweaked_compressed.data() + 1;
+			    for (int i = 0; i < 8; i++) {
+				    tweaked_prefix = (tweaked_prefix << 8) | tx[i];
+			    }
+
+			    for (idx_t j = 0; j < outputs_list.length; j++) {
+				    idx_t output_idx = outputs_list.offset + j;
+				    if (FlatVector::IsNull(outputs_child, output_idx))
+					    continue;
+				    auto output_val = FlatVector::GetData<int64_t>(outputs_child)[output_idx];
+				    if (output_val == tweaked_prefix) {
+					    return true;
+				    }
+			    }
+		    }
+
+		    return false;
+	    });
+}
+
+// ============================================================================
 // Extension registration
 // ============================================================================
 
@@ -845,6 +1121,13 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    });
 	backend_func.stability = FunctionStability::CONSISTENT;
 	loader.RegisterFunction(backend_func);
+
+	// scan_silent_payments — drop-in replacement for secp256k1 extension
+	auto scan_sp_function = ScalarFunction("scan_silent_payments",
+	                                       {LogicalType::LIST(LogicalType::BIGINT),
+	                                        LogicalType::LIST(LogicalType::BLOB), LogicalType::LIST(LogicalType::BLOB)},
+	                                       LogicalType::BOOLEAN, ScanSilentPaymentsScalarFun);
+	loader.RegisterFunction(scan_sp_function);
 }
 
 void UfsecpExtension::Load(ExtensionLoader &loader) {
