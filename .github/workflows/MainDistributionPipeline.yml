@@ -4,6 +4,7 @@
 name: Main Extension Distribution Pipeline
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -18,7 +19,7 @@ jobs:
     with:
       duckdb_version: v1.4.4
       ci_tools_version: v1.4.4
-      extension_name: quack
+      extension_name: ufsecp
 
   code-quality-check:
     name: Code Quality Check
@@ -26,5 +27,5 @@ jobs:
     with:
       duckdb_version: v1.4.4
       ci_tools_version: v1.4.4
-      extension_name: quack
+      extension_name: ufsecp
       format_checks: 'format;tidy'
