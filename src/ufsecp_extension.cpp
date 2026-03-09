@@ -17,6 +17,7 @@
 #include <secp256k1/tagged_hash.hpp>
 #include <secp256k1/sha256.hpp>
 #include <secp256k1/batch_add_affine.hpp>
+#include <secp256k1/precompute.hpp>
 
 #include <vector>
 #include <cstring>
@@ -825,6 +826,32 @@ static void LoadInternal(ExtensionLoader &loader) {
 	func.named_parameters["batch_size"] = LogicalType::INTEGER;
 	func.named_parameters["backend"] = LogicalType::VARCHAR;
 	loader.RegisterFunction(func);
+
+	// ufsecp_set_cache_dir(path) — set precompute table cache directory
+	ScalarFunction set_cache_dir_func(
+	    "ufsecp_set_cache_dir", {LogicalType::VARCHAR}, LogicalType::VARCHAR,
+	    [](DataChunk &args, ExpressionState &state, Vector &result) {
+		    auto &path_vector = args.data[0];
+		    auto path_str = path_vector.GetValue(0).ToString();
+		    // Set the full cache file path explicitly to bypass get_default_cache_path(),
+		    // which only returns cache_dir paths for files that already exist.
+		    std::string cache_path = path_str + "/cache_w18.bin";
+#ifdef _WIN32
+		    _putenv_s("SECP256K1_CACHE_PATH", cache_path.c_str());
+#else
+		    setenv("SECP256K1_CACHE_PATH", cache_path.c_str(), 1);
+#endif
+		    // Re-configure to pick up the new env vars, then eagerly build+cache
+		    // the tables. ensure_fixed_base_ready() is needed because the GPU scan
+		    // path bypasses Point::generator().scalar_mul() and would never trigger
+		    // the lazy build.
+		    secp256k1::fast::configure_fixed_base(secp256k1::fast::FixedBaseConfig{});
+		    secp256k1::fast::ensure_fixed_base_ready();
+		    result.SetValue(0, Value(path_str));
+		    result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	    });
+	set_cache_dir_func.stability = FunctionStability::VOLATILE;
+	loader.RegisterFunction(set_cache_dir_func);
 
 	// ufsecp_backend() — returns current backend info
 	ScalarFunction backend_func(
