@@ -4,9 +4,12 @@ PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 EXT_NAME=ufsecp
 EXT_CONFIG=${PROJ_DIR}extension_config.cmake
 
-# Forward UFSECP_ENABLE_CUDA to CMake via EXT_FLAGS
+# Forward GPU toggles to CMake via EXT_FLAGS (can be combined)
 ifdef UFSECP_ENABLE_CUDA
 EXT_FLAGS += -DUFSECP_ENABLE_CUDA=$(UFSECP_ENABLE_CUDA)
+endif
+ifdef UFSECP_ENABLE_OPENCL
+EXT_FLAGS += -DUFSECP_ENABLE_OPENCL=$(UFSECP_ENABLE_OPENCL)
 endif
 
 # Include the Makefile from extension-ci-tools

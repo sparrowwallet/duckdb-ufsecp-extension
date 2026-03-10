@@ -190,7 +190,7 @@ __global__ void BIP352FusedKernel(
 
 extern "C" {
 
-int UfsecpGpuDetect(int* num_gpus) {
+int UfsecpCudaDetect(int* num_gpus) {
     cudaError_t err = cudaGetDeviceCount(num_gpus);
     if (err != cudaSuccess) {
         *num_gpus = 0;
@@ -199,7 +199,7 @@ int UfsecpGpuDetect(int* num_gpus) {
     return 0;
 }
 
-void* UfsecpGpuLaunchBatch(
+void* UfsecpCudaLaunchBatch(
     const uint8_t* scan_key,       // 32 bytes (LE, same for all rows)
     const uint8_t* tweak_data,     // N × 64 bytes
     uint32_t count,
@@ -252,7 +252,7 @@ fail:
     return nullptr;
 }
 
-int UfsecpGpuRunKernels(
+int UfsecpCudaRunKernels(
     void* state_handle,
     uint8_t* out_x,            // host: N × 32 bytes (LE)
     uint8_t* out_y,            // host: N × 32 bytes (LE)
@@ -288,7 +288,7 @@ int UfsecpGpuRunKernels(
     return (err == cudaSuccess) ? 0 : -1;
 }
 
-void UfsecpGpuFreeBatch(void* state_handle) {
+void UfsecpCudaFreeBatch(void* state_handle) {
     if (!state_handle) return;
     auto* state = static_cast<UfsecpGpuBatchState*>(state_handle);
 

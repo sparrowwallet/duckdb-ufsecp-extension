@@ -24,13 +24,21 @@
 #include <mutex>
 #include <atomic>
 
-// Conditional CUDA support — extern "C" declarations for ufsecp_gpu.cu
+// Conditional GPU support — extern "C" declarations for each backend
 #ifdef UFSECP_CUDA_ENABLED
 extern "C" {
-int UfsecpGpuDetect(int *num_gpus);
-void *UfsecpGpuLaunchBatch(const uint8_t *scan_key, const uint8_t *tweak_data, uint32_t count, int device_id);
-int UfsecpGpuRunKernels(void *state_handle, uint8_t *out_x, uint8_t *out_y, uint32_t count);
-void UfsecpGpuFreeBatch(void *state_handle);
+int UfsecpCudaDetect(int *num_gpus);
+void *UfsecpCudaLaunchBatch(const uint8_t *scan_key, const uint8_t *tweak_data, uint32_t count, int device_id);
+int UfsecpCudaRunKernels(void *state_handle, uint8_t *out_x, uint8_t *out_y, uint32_t count);
+void UfsecpCudaFreeBatch(void *state_handle);
+}
+#endif
+#ifdef UFSECP_OPENCL_ENABLED
+extern "C" {
+int UfsecpOclDetect(int *num_gpus);
+void *UfsecpOclLaunchBatch(const uint8_t *scan_key, const uint8_t *tweak_data, uint32_t count, int device_id);
+int UfsecpOclRunKernels(void *state_handle, uint8_t *out_x, uint8_t *out_y, uint32_t count);
+void UfsecpOclFreeBatch(void *state_handle);
 }
 #endif
 
@@ -46,10 +54,18 @@ using secp256k1::fast::Scalar;
 // GPU detection state (compile-time conditional)
 // ============================================================================
 
-#ifdef UFSECP_CUDA_ENABLED
+#ifdef UFSECP_GPU_ENABLED
+enum class GpuBackend { NONE, CUDA, OPENCL };
+
+static GpuBackend g_gpu_backend = GpuBackend::NONE;
 static int g_num_gpus = 0;
 static bool g_gpu_detected = false;
 static std::mutex g_gpu_init_mutex;
+
+// Function pointers for the active GPU backend
+static void *(*g_gpu_launch)(const uint8_t *, const uint8_t *, uint32_t, int) = nullptr;
+static int (*g_gpu_run)(void *, uint8_t *, uint8_t *, uint32_t) = nullptr;
+static void (*g_gpu_free)(void *) = nullptr;
 
 static void EnsureGpuDetected() {
 	if (g_gpu_detected)
@@ -57,7 +73,38 @@ static void EnsureGpuDetected() {
 	std::lock_guard<std::mutex> lock(g_gpu_init_mutex);
 	if (g_gpu_detected)
 		return;
-	UfsecpGpuDetect(&g_num_gpus);
+
+	// Try CUDA first (higher performance), then OpenCL
+#ifdef UFSECP_CUDA_ENABLED
+	{
+		int cuda_gpus = 0;
+		UfsecpCudaDetect(&cuda_gpus);
+		if (cuda_gpus > 0) {
+			g_num_gpus = cuda_gpus;
+			g_gpu_backend = GpuBackend::CUDA;
+			g_gpu_launch = UfsecpCudaLaunchBatch;
+			g_gpu_run = UfsecpCudaRunKernels;
+			g_gpu_free = UfsecpCudaFreeBatch;
+			g_gpu_detected = true;
+			return;
+		}
+	}
+#endif
+#ifdef UFSECP_OPENCL_ENABLED
+	{
+		int ocl_gpus = 0;
+		UfsecpOclDetect(&ocl_gpus);
+		if (ocl_gpus > 0) {
+			g_num_gpus = ocl_gpus;
+			g_gpu_backend = GpuBackend::OPENCL;
+			g_gpu_launch = UfsecpOclLaunchBatch;
+			g_gpu_run = UfsecpOclRunKernels;
+			g_gpu_free = UfsecpOclFreeBatch;
+			g_gpu_detected = true;
+			return;
+		}
+	}
+#endif
 	g_gpu_detected = true;
 }
 #endif
@@ -159,7 +206,7 @@ struct UfsecpScanLocalState : public LocalTableFunctionState {
 	// Reusable scratch buffers (avoid per-batch heap allocation)
 	std::vector<FieldElement> scratch;
 
-#ifdef UFSECP_CUDA_ENABLED
+#ifdef UFSECP_GPU_ENABLED
 	int assigned_gpu = -1; // GPU device ID for this thread (-1 = CPU)
 #endif
 };
@@ -412,7 +459,7 @@ static bool ShouldProcessBatch(const UfsecpScanLocalState &local_state, const Uf
 // ProcessBatchGpu — GPU-accelerated BIP-352 scanning (phases 1-4 on GPU)
 // ============================================================================
 
-#ifdef UFSECP_CUDA_ENABLED
+#ifdef UFSECP_GPU_ENABLED
 static void ProcessBatchGpu(UfsecpScanLocalState &local_state, const UfsecpScanBindData &bind_data,
                             UfsecpScanState &global_state) {
 	idx_t N = local_state.accumulated_txids.size();
@@ -430,8 +477,7 @@ static void ProcessBatchGpu(UfsecpScanLocalState &local_state, const UfsecpScanB
 	// Launch GPU batch
 	const uint8_t *scan_key = reinterpret_cast<const uint8_t *>(bind_data.scan_private_key_data.data());
 
-	void *gpu_state =
-	    UfsecpGpuLaunchBatch(scan_key, tweak_buf.data(), static_cast<uint32_t>(N), local_state.assigned_gpu);
+	void *gpu_state = g_gpu_launch(scan_key, tweak_buf.data(), static_cast<uint32_t>(N), local_state.assigned_gpu);
 
 	if (!gpu_state) {
 		// GPU launch failed — fall back to CPU
@@ -443,9 +489,9 @@ static void ProcessBatchGpu(UfsecpScanLocalState &local_state, const UfsecpScanB
 	std::vector<uint8_t> out_x_bytes(N * 32);
 	std::vector<uint8_t> out_y_bytes(N * 32);
 
-	int result = UfsecpGpuRunKernels(gpu_state, out_x_bytes.data(), out_y_bytes.data(), static_cast<uint32_t>(N));
+	int result = g_gpu_run(gpu_state, out_x_bytes.data(), out_y_bytes.data(), static_cast<uint32_t>(N));
 
-	UfsecpGpuFreeBatch(gpu_state);
+	g_gpu_free(gpu_state);
 
 	if (result != 0) {
 		// Kernel failed — fall back to CPU
@@ -627,21 +673,21 @@ static unique_ptr<FunctionData> UfsecpScanBind(ClientContext &context, TableFunc
 	bind_data->backend = backend_str;
 
 	// Resolve backend
-#ifdef UFSECP_CUDA_ENABLED
+#ifdef UFSECP_GPU_ENABLED
 	EnsureGpuDetected();
 	if (bind_data->backend == "gpu") {
-		if (g_num_gpus == 0) {
-			throw InvalidInputException("backend='gpu' requested but no CUDA GPU detected");
+		if (g_gpu_backend == GpuBackend::NONE) {
+			throw InvalidInputException("backend='gpu' requested but no GPU detected");
 		}
 		bind_data->use_gpu = true;
 	} else if (bind_data->backend == "auto") {
-		bind_data->use_gpu = (g_num_gpus > 0);
+		bind_data->use_gpu = (g_gpu_backend != GpuBackend::NONE);
 	} else {
 		bind_data->use_gpu = false;
 	}
 #else
 	if (bind_data->backend == "gpu") {
-		throw InvalidInputException("backend='gpu' requested but extension was compiled without CUDA support");
+		throw InvalidInputException("backend='gpu' requested but extension was compiled without GPU support");
 	}
 	bind_data->use_gpu = false;
 #endif
@@ -697,7 +743,7 @@ static unique_ptr<LocalTableFunctionState> UfsecpScanLocalInit(ExecutionContext 
 	state.currently_adding++;
 	auto local_state = make_uniq<UfsecpScanLocalState>();
 
-#ifdef UFSECP_CUDA_ENABLED
+#ifdef UFSECP_GPU_ENABLED
 	// Round-robin GPU assignment (same pattern as cudasp)
 	auto &bind_data = input.bind_data->Cast<UfsecpScanBindData>();
 	if (bind_data.use_gpu && g_num_gpus > 0) {
@@ -722,7 +768,7 @@ static OperatorResultType UfsecpScanFunction(ExecutionContext &context, TableFun
 	if (input.size() > 0) {
 		AccumulateInput(local_state, input);
 		if (ShouldProcessBatch(local_state, bind_data)) {
-#ifdef UFSECP_CUDA_ENABLED
+#ifdef UFSECP_GPU_ENABLED
 			if (bind_data.use_gpu) {
 				ProcessBatchGpu(local_state, bind_data, global_state);
 			} else {
@@ -749,7 +795,7 @@ static OperatorFinalizeResultType UfsecpScanFinalFunction(ExecutionContext &cont
 
 	// Process any remaining accumulated data from this thread
 	if (!local_state.finalized && !local_state.accumulated_txids.empty()) {
-#ifdef UFSECP_CUDA_ENABLED
+#ifdef UFSECP_GPU_ENABLED
 		if (bind_data.use_gpu) {
 			ProcessBatchGpu(local_state, bind_data, state);
 		} else {
@@ -856,12 +902,14 @@ static void LoadInternal(ExtensionLoader &loader) {
 	ScalarFunction backend_func(
 	    "ufsecp_backend", {}, LogicalType::VARCHAR, [](DataChunk &args, ExpressionState &state, Vector &result) {
 		    std::string backend_str;
-#ifdef UFSECP_CUDA_ENABLED
+#ifdef UFSECP_GPU_ENABLED
 		    EnsureGpuDetected();
-		    if (g_num_gpus > 0) {
-			    backend_str = "gpu (" + std::to_string(g_num_gpus) + " device" + (g_num_gpus > 1 ? "s" : "") + ")";
+		    if (g_gpu_backend == GpuBackend::CUDA) {
+			    backend_str = "cuda (" + std::to_string(g_num_gpus) + " device" + (g_num_gpus > 1 ? "s" : "") + ")";
+		    } else if (g_gpu_backend == GpuBackend::OPENCL) {
+			    backend_str = "opencl (" + std::to_string(g_num_gpus) + " device" + (g_num_gpus > 1 ? "s" : "") + ")";
 		    } else {
-			    backend_str = "cpu (CUDA compiled, no GPU detected)";
+			    backend_str = "cpu (GPU compiled, no GPU detected)";
 		    }
 #else
 			backend_str = "cpu";

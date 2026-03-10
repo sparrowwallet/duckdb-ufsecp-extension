@@ -1,12 +1,12 @@
 # DuckDB UltrafastSecp256k1 Extension
 
-A DuckDB extension for Bitcoin Silent Payments (BIP-352) scanning using [UltrafastSecp256k1](https://github.com/shrec/UltrafastSecp256k1). Supports both CPU and optional NVIDIA GPU acceleration.
+A DuckDB extension for Bitcoin Silent Payments (BIP-352) scanning using [UltrafastSecp256k1](https://github.com/shrec/UltrafastSecp256k1). Supports CPU, optional NVIDIA CUDA, and optional OpenCL GPU acceleration.
 
 ## Features
 
 - **BIP-352 scanning**: Full Silent Payments pipeline (scalar multiply, tagged hash, generator multiply, point addition, prefix matching)
 - **Label support**: Tests both base output and label-tweaked variants
-- **CPU + GPU**: CPU-only by default, with optional CUDA acceleration for NVIDIA GPUs (Ampere+)
+- **CPU + GPU**: CPU-only by default, with optional CUDA or OpenCL GPU acceleration
 - **Batch processing**: Configurable batch sizes for optimal throughput
 - **Automatic backend selection**: Detects available GPUs and selects the best backend
 
@@ -19,9 +19,13 @@ A DuckDB extension for Bitcoin Silent Payments (BIP-352) scanning using [Ultrafa
 - OpenSSL
 - Git
 
-For GPU support (optional):
+For CUDA GPU support (optional):
 - NVIDIA GPU with compute capability 8.0+ (Ampere, Ada Lovelace, Hopper, Blackwell)
 - CUDA Toolkit 12.8+
+
+For OpenCL GPU support (optional):
+- Any GPU with OpenCL 1.2+ support (NVIDIA, AMD, Intel)
+- OpenCL ICD loader and GPU driver
 
 ### Build steps
 
@@ -38,6 +42,16 @@ GEN=ninja make
 With CUDA GPU support:
 ```bash
 UFSECP_ENABLE_CUDA=ON GEN=ninja make
+```
+
+With OpenCL GPU support:
+```bash
+UFSECP_ENABLE_OPENCL=ON GEN=ninja make
+```
+
+With both CUDA and OpenCL (runtime auto-selection: CUDA preferred → OpenCL fallback → CPU):
+```bash
+UFSECP_ENABLE_CUDA=ON UFSECP_ENABLE_OPENCL=ON GEN=ninja make
 ```
 
 Run tests:
@@ -94,14 +108,24 @@ Returns a string describing the active backend.
 
 ```sql
 SELECT ufsecp_backend();
--- 'cpu', 'gpu (2 devices)', or 'cpu (CUDA compiled, no GPU detected)'
+-- 'cpu', 'cuda (2 devices)', 'opencl (1 device)', or 'cpu (OpenCL compiled, no GPU detected)'
 ```
+
+### `ufsecp_set_cache_dir(path)`
+
+Sets the directory for the precomputed lookup table cache and eagerly builds the table if it doesn't exist yet. Returns the path on success.
+
+```sql
+SELECT ufsecp_set_cache_dir('/path/to/cache');
+```
+
+This writes a ~244 MB file (`cache_w18.bin`) to the specified directory. The table is used for fast fixed-base scalar multiplication and is generated once on first use.
 
 ## Precomputed table cache
 
 UltrafastSecp256k1 generates a ~244 MB precomputed lookup table (`cache_w18.bin`) on first use for fast fixed-scalar multiplication. This file is written to the current working directory by default.
 
-To control the cache location, set the environment variable before loading the extension:
+To control the cache location, call `ufsecp_set_cache_dir()` after loading the extension, or set the environment variable before loading:
 
 ```bash
 export SECP256K1_CACHE_DIR=/path/to/cache/directory
@@ -118,7 +142,8 @@ export SECP256K1_CACHE_PATH=/path/to/cache_w18.bin
 - [UltrafastSecp256k1](https://github.com/shrec/UltrafastSecp256k1): High-performance secp256k1 library
 - [DuckDB](https://duckdb.org/): In-process analytical database
 - OpenSSL
-- NVIDIA CUDA Runtime (optional, for GPU acceleration)
+- NVIDIA CUDA Runtime (optional, for CUDA GPU acceleration)
+- OpenCL ICD loader (optional, for OpenCL GPU acceleration)
 
 ## License
 
