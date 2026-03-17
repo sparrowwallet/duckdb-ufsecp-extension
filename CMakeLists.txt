@@ -154,6 +154,28 @@ if(UFSECP_ENABLE_CUDA)
 endif()
 
 if(UFSECP_ENABLE_OPENCL)
+    # Generate embedded fused kernel source header
+    set(OPENCL_KERNEL_DIR ${CMAKE_CURRENT_SOURCE_DIR}/UltrafastSecp256k1/opencl/kernels)
+    add_custom_command(
+        OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/opencl_fused_kernel_source.h
+        COMMAND ${CMAKE_COMMAND}
+            -DKERNEL_DIR=${OPENCL_KERNEL_DIR}
+            -DOUTPUT_FILE=${CMAKE_CURRENT_BINARY_DIR}/opencl_fused_kernel_source.h
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_opencl_fused_kernel.cmake
+        DEPENDS
+            ${OPENCL_KERNEL_DIR}/secp256k1_field.cl
+            ${OPENCL_KERNEL_DIR}/secp256k1_point.cl
+            ${OPENCL_KERNEL_DIR}/secp256k1_extended.cl
+            ${OPENCL_KERNEL_DIR}/secp256k1_affine.cl
+            ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_opencl_fused_kernel.cmake
+        COMMENT "Embedding OpenCL fused BIP-352 kernel source"
+    )
+    add_custom_target(opencl_fused_kernel_header DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/opencl_fused_kernel_source.h)
+    add_dependencies(${EXTENSION_NAME} opencl_fused_kernel_header)
+    add_dependencies(${LOADABLE_EXTENSION_NAME} opencl_fused_kernel_header)
+    target_include_directories(${EXTENSION_NAME} PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+    target_include_directories(${LOADABLE_EXTENSION_NAME} PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+
     target_compile_definitions(${EXTENSION_NAME} PRIVATE UFSECP_OPENCL_ENABLED UFSECP_GPU_ENABLED)
     target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE UFSECP_OPENCL_ENABLED UFSECP_GPU_ENABLED)
 endif()

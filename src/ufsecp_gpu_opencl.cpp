@@ -4,7 +4,10 @@
 // Implements the same extern "C" interface as ufsecp_gpu.cu so that
 // ProcessBatchGpu in ufsecp_extension.cpp works identically for both backends.
 //
-// Pipeline (matching CUDA phases 1-4):
+// Preferred path: fused single-dispatch kernel (bip352_fused_kernel)
+//   All 5 phases run on GPU in one dispatch per thread.
+//
+// Fallback path: multi-dispatch pipeline
 //   Phase 1: batch_scalar_mul       — shared_secret = scan_key × tweak[i]  (GPU)
 //   Phase 2: batch_jacobian_to_affine                                       (GPU)
 //   Phase 3: serialize + tagged SHA-256("BIP0352/SharedSecret", ...)        (CPU)
@@ -20,10 +23,15 @@
 #include <secp256k1/tagged_hash.hpp>
 #include <secp256k1/sha256.hpp>
 
+// Raw OpenCL API for fused kernel compilation
+#include <CL/cl.h>
+
 #include <mutex>
 #include <vector>
 #include <cstdint>
 #include <cstring>
+
+#include "opencl_fused_kernel_source.h"
 
 namespace ocl = secp256k1::opencl;
 
@@ -36,22 +44,41 @@ static std::mutex g_ocl_mutex;
 static bool g_ocl_initialized = false;
 static int g_ocl_device_count = 0;
 
-// BIP0352/SharedSecret tag midstate (computed once)
+// BIP0352/SharedSecret tag midstate (computed once, for multi-dispatch fallback)
 static secp256k1::SHA256 g_tag_midstate;
 static bool g_tag_computed = false;
+
+// Fused kernel state
+static cl_program g_fused_program = nullptr;
+static cl_kernel g_fused_kernel = nullptr;
+static bool g_use_fused = false;
+
+// BIP0352/SharedSecret midstate as 8 x uint32_t for the fused GPU kernel
+static const uint32_t g_bip352_midstate[8] = {0x88831537U, 0x5127079bU, 0x69c2137bU, 0xab0303e6U,
+                                              0x98fa21faU, 0x4a888523U, 0xbd99daabU, 0xf25e5e0aU};
 
 // ============================================================================
 // Per-batch state (allocated in LaunchBatch, freed in FreeBatch)
 // ============================================================================
 
 struct UfsecpOclBatchState {
-	std::vector<ocl::Scalar> scan_scalars;      // N copies of scan_scalar
-	std::vector<ocl::AffinePoint> tweak_points; // N affine points from input
+	// Fused path: raw OpenCL buffers
+	cl_mem tweak_buf;
+	cl_mem scan_key_buf;
+	cl_mem out_x_buf;
+	cl_mem out_y_buf;
+	cl_mem midstate_buf;
+
+	// Multi-dispatch fallback (existing fields)
+	std::vector<ocl::Scalar> scan_scalars;
+	std::vector<ocl::AffinePoint> tweak_points;
+
 	uint32_t count;
+	bool use_fused;
 };
 
 // ============================================================================
-// Byte-order conversion helpers
+// Byte-order conversion helpers (used by multi-dispatch fallback)
 // ============================================================================
 
 // LE bytes (Frigate wire format) → OpenCL Scalar (LE limbs)
@@ -132,6 +159,50 @@ int UfsecpOclDetect(int *num_gpus) {
 		g_ocl_ctx = ocl::Context::create(config);
 		if (g_ocl_ctx && g_ocl_ctx->is_valid()) {
 			g_ocl_device_count = 1;
+
+			// Try to compile the fused kernel using the library's OpenCL context
+			auto *ctx = static_cast<cl_context>(g_ocl_ctx->native_context());
+			auto *queue = static_cast<cl_command_queue>(g_ocl_ctx->native_queue());
+			if (ctx && queue) {
+				// Get device from command queue
+				cl_device_id device = nullptr;
+				clGetCommandQueueInfo(queue, CL_QUEUE_DEVICE, sizeof(device), &device, nullptr);
+
+				if (device) {
+					const char *src = OPENCL_FUSED_KERNEL_SOURCE;
+					size_t src_len = strlen(src);
+					cl_int err;
+					g_fused_program = clCreateProgramWithSource(ctx, 1, &src, &src_len, &err);
+					if (err == CL_SUCCESS) {
+						err = clBuildProgram(g_fused_program, 1, &device,
+						                     "-cl-std=CL1.2 -cl-fast-relaxed-math -cl-mad-enable", nullptr, nullptr);
+						if (err == CL_SUCCESS) {
+							g_fused_kernel = clCreateKernel(g_fused_program, "bip352_fused_kernel", &err);
+							if (err == CL_SUCCESS) {
+								g_use_fused = true;
+								fprintf(stderr, "[OpenCL] Fused BIP-352 kernel available\n");
+							}
+						} else {
+							// Log build error for debugging
+							size_t log_size = 0;
+							clGetProgramBuildInfo(g_fused_program, device, CL_PROGRAM_BUILD_LOG, 0, nullptr, &log_size);
+							if (log_size > 1) {
+								std::vector<char> log(log_size);
+								clGetProgramBuildInfo(g_fused_program, device, CL_PROGRAM_BUILD_LOG, log_size,
+								                      log.data(), nullptr);
+								fprintf(stderr, "[OpenCL] Fused kernel build failed:\n%s\n", log.data());
+							}
+						}
+					}
+					if (!g_use_fused) {
+						fprintf(stderr, "[OpenCL] Fused kernel unavailable, using multi-dispatch fallback\n");
+						if (g_fused_program) {
+							clReleaseProgram(g_fused_program);
+							g_fused_program = nullptr;
+						}
+					}
+				}
+			}
 		}
 		g_ocl_initialized = true;
 	}
@@ -147,15 +218,71 @@ void *UfsecpOclLaunchBatch(const uint8_t *scan_key, const uint8_t *tweak_data, u
 
 	auto *state = new UfsecpOclBatchState();
 	state->count = count;
+	state->use_fused = g_use_fused;
 
-	// Convert scan key (LE bytes → OpenCL Scalar), replicate for batch API
-	ocl::Scalar scan_scalar = scalar_from_le(scan_key);
-	state->scan_scalars.resize(count, scan_scalar);
+	if (state->use_fused) {
+		// Fused path: copy raw LE bytes directly into OpenCL buffers (no conversion)
+		auto *ctx = static_cast<cl_context>(g_ocl_ctx->native_context());
+		cl_int err;
 
-	// Convert tweak points (N × 64 LE bytes → OpenCL AffinePoints)
-	state->tweak_points.resize(count);
-	for (uint32_t i = 0; i < count; i++)
-		state->tweak_points[i] = affine_from_le(tweak_data + i * 64);
+		state->tweak_buf = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, count * 64,
+		                                  const_cast<uint8_t *>(tweak_data), &err);
+		if (err != CL_SUCCESS) {
+			delete state;
+			return nullptr;
+		}
+
+		state->scan_key_buf =
+		    clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, 32, const_cast<uint8_t *>(scan_key), &err);
+		if (err != CL_SUCCESS) {
+			clReleaseMemObject(state->tweak_buf);
+			delete state;
+			return nullptr;
+		}
+
+		state->out_x_buf = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY, count * 32, nullptr, &err);
+		if (err != CL_SUCCESS) {
+			clReleaseMemObject(state->tweak_buf);
+			clReleaseMemObject(state->scan_key_buf);
+			delete state;
+			return nullptr;
+		}
+
+		state->out_y_buf = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY, count * 32, nullptr, &err);
+		if (err != CL_SUCCESS) {
+			clReleaseMemObject(state->tweak_buf);
+			clReleaseMemObject(state->scan_key_buf);
+			clReleaseMemObject(state->out_x_buf);
+			delete state;
+			return nullptr;
+		}
+
+		state->midstate_buf = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, 8 * sizeof(uint32_t),
+		                                     const_cast<uint32_t *>(g_bip352_midstate), &err);
+		if (err != CL_SUCCESS) {
+			clReleaseMemObject(state->tweak_buf);
+			clReleaseMemObject(state->scan_key_buf);
+			clReleaseMemObject(state->out_x_buf);
+			clReleaseMemObject(state->out_y_buf);
+			delete state;
+			return nullptr;
+		}
+	} else {
+		// Multi-dispatch fallback: convert to library types
+		ocl::Scalar scan_scalar = scalar_from_le(scan_key);
+		state->scan_scalars.resize(count, scan_scalar);
+
+		state->tweak_points.resize(count);
+		for (uint32_t i = 0; i < count; i++)
+			state->tweak_points[i] = affine_from_le(tweak_data + i * 64);
+
+		// Zero out buffer handles so FreeBatch doesn't release them
+		state->tweak_buf = nullptr;
+		state->scan_key_buf = nullptr;
+		state->out_x_buf = nullptr;
+		state->out_y_buf = nullptr;
+		state->midstate_buf = nullptr;
+	}
 
 	return state;
 }
@@ -164,6 +291,47 @@ int UfsecpOclRunKernels(void *state_handle, uint8_t *out_x, uint8_t *out_y, uint
 	auto *state = static_cast<UfsecpOclBatchState *>(state_handle);
 	if (!state || !g_ocl_ctx)
 		return -1;
+
+	// ====================================================================
+	// Fused path: single GPU dispatch
+	// ====================================================================
+	if (state->use_fused) {
+		auto *queue = static_cast<cl_command_queue>(g_ocl_ctx->native_queue());
+
+		// Set kernel arguments
+		clSetKernelArg(g_fused_kernel, 0, sizeof(cl_mem), &state->tweak_buf);
+		clSetKernelArg(g_fused_kernel, 1, sizeof(cl_mem), &state->scan_key_buf);
+		clSetKernelArg(g_fused_kernel, 2, sizeof(cl_mem), &state->out_x_buf);
+		clSetKernelArg(g_fused_kernel, 3, sizeof(cl_mem), &state->out_y_buf);
+		clSetKernelArg(g_fused_kernel, 4, sizeof(cl_mem), &state->midstate_buf);
+		clSetKernelArg(g_fused_kernel, 5, sizeof(uint32_t), &count);
+
+		// Query preferred work group size
+		size_t local_size = 256;
+		clGetKernelWorkGroupInfo(g_fused_kernel, nullptr, CL_KERNEL_WORK_GROUP_SIZE, sizeof(local_size), &local_size,
+		                         nullptr);
+		if (local_size > 256)
+			local_size = 256;
+
+		// Round global size up to multiple of local size
+		size_t global_size = ((size_t)count + local_size - 1) / local_size * local_size;
+
+		cl_int err =
+		    clEnqueueNDRangeKernel(queue, g_fused_kernel, 1, nullptr, &global_size, &local_size, 0, nullptr, nullptr);
+		if (err != CL_SUCCESS)
+			return -1;
+
+		// Read back results
+		clEnqueueReadBuffer(queue, state->out_x_buf, CL_TRUE, 0, count * 32, out_x, 0, nullptr, nullptr);
+		clEnqueueReadBuffer(queue, state->out_y_buf, CL_TRUE, 0, count * 32, out_y, 0, nullptr, nullptr);
+		clFinish(queue);
+
+		return 0;
+	}
+
+	// ====================================================================
+	// Multi-dispatch fallback path
+	// ====================================================================
 
 	// Compute tag midstate once (thread-safe: worst case is redundant computation)
 	if (!g_tag_computed) {
@@ -208,7 +376,18 @@ int UfsecpOclRunKernels(void *state_handle, uint8_t *out_x, uint8_t *out_y, uint
 void UfsecpOclFreeBatch(void *state_handle) {
 	if (!state_handle)
 		return;
-	delete static_cast<UfsecpOclBatchState *>(state_handle);
+	auto *state = static_cast<UfsecpOclBatchState *>(state_handle);
+	if (state->tweak_buf)
+		clReleaseMemObject(state->tweak_buf);
+	if (state->scan_key_buf)
+		clReleaseMemObject(state->scan_key_buf);
+	if (state->out_x_buf)
+		clReleaseMemObject(state->out_x_buf);
+	if (state->out_y_buf)
+		clReleaseMemObject(state->out_y_buf);
+	if (state->midstate_buf)
+		clReleaseMemObject(state->midstate_buf);
+	delete state;
 }
 
 } // extern "C"
