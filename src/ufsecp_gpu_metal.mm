@@ -4,7 +4,10 @@
 // Implements the same extern "C" interface as ufsecp_gpu_opencl.cpp so that
 // ProcessBatchGpu in ufsecp_extension.cpp works identically for all backends.
 //
-// Pipeline (matching OpenCL phases):
+// Preferred path: fused single-dispatch kernel (bip352_fused_kernel)
+//   All 5 phases run on GPU in one dispatch per thread.
+//
+// Fallback path: multi-dispatch pipeline
 //   Phase 1: scalar_mul_batch         -- shared_secret = scan_key * tweak[i]  (GPU)
 //   Phase 2: serialize + tagged SHA-256("BIP0352/SharedSecret", ...)          (CPU)
 //   Phase 3: generator_mul_batch      -- output = hash * G                    (GPU)
@@ -22,6 +25,8 @@
 #include <secp256k1/tagged_hash.hpp>
 #include <secp256k1/sha256.hpp>
 
+#include <openssl/sha.h>
+
 #include <mutex>
 #include <vector>
 #include <cstdint>
@@ -38,6 +43,8 @@ namespace mtl = secp256k1::metal;
 static std::unique_ptr<mtl::MetalRuntime> g_runtime;
 static mtl::ComputePipeline g_scalar_mul_pipeline;
 static mtl::ComputePipeline g_generator_mul_pipeline;
+static mtl::ComputePipeline g_fused_pipeline;
+static bool g_use_fused = false;
 static std::mutex g_metal_mutex;
 static bool g_metal_initialized = false;
 static int g_metal_device_count = 0;
@@ -46,18 +53,32 @@ static int g_metal_device_count = 0;
 static secp256k1::SHA256 g_tag_midstate;
 static bool g_tag_computed = false;
 
+// BIP0352/SharedSecret midstate as 8 x uint32_t for the fused GPU kernel
+static uint32_t g_bip352_midstate[8];
+
 // ============================================================================
 // Per-batch state (allocated in LaunchBatch, freed in FreeBatch)
 // ============================================================================
 
 struct UfsecpMetalBatchState {
-    std::vector<mtl::HostScalar> scan_scalars;       // N copies of scan_scalar
-    std::vector<mtl::HostAffinePoint> tweak_points;  // N affine points from input
+    // Fused path: raw LE byte buffers
+    mtl::MetalBuffer tweak_buf;
+    mtl::MetalBuffer scan_key_buf;
+    mtl::MetalBuffer out_x_buf;
+    mtl::MetalBuffer out_y_buf;
+    mtl::MetalBuffer midstate_buf;
+    mtl::MetalBuffer count_buf;
+
+    // Multi-dispatch fallback (existing fields)
+    std::vector<mtl::HostScalar> scan_scalars;
+    std::vector<mtl::HostAffinePoint> tweak_points;
+
     uint32_t count;
+    bool use_fused;
 };
 
 // ============================================================================
-// Byte-order conversion helpers
+// Byte-order conversion helpers (used by multi-dispatch fallback)
 // ============================================================================
 
 // LE bytes (Frigate wire format) -> Metal HostScalar (LE limbs)
@@ -124,6 +145,29 @@ static void affine_to_le(const mtl::HostAffinePoint &ap, uint8_t *out_x, uint8_t
 }
 
 // ============================================================================
+// BIP352 midstate computation using OpenSSL SHA-256
+// ============================================================================
+
+static void compute_bip352_midstate(uint32_t out[8]) {
+    // SHA256("BIP0352/SharedSecret") -> tag_hash
+    unsigned char tag_hash[32];
+    SHA256(reinterpret_cast<const unsigned char *>("BIP0352/SharedSecret"), 20, tag_hash);
+
+    // Build 64-byte block: tag_hash || tag_hash
+    unsigned char block[64];
+    std::memcpy(block, tag_hash, 32);
+    std::memcpy(block + 32, tag_hash, 32);
+
+    // Process one block through SHA-256 to get the midstate
+    SHA256_CTX ctx;
+    SHA256_Init(&ctx);
+    SHA256_Update(&ctx, block, 64);
+    // ctx.h now contains the midstate (after processing the 64-byte block)
+    for (int i = 0; i < 8; i++)
+        out[i] = ctx.h[i];
+}
+
+// ============================================================================
 // Extern "C" interface -- same signatures as ufsecp_gpu_opencl.cpp
 // ============================================================================
 
@@ -144,6 +188,16 @@ int UfsecpMetalDetect(int *num_gpus) {
                     auto info = g_runtime->device_info();
                     fprintf(stderr, "[Metal] GPU detected: %s\n", info.name.c_str());
                 }
+
+                // Try to create the fused pipeline
+                g_fused_pipeline = g_runtime->make_pipeline("bip352_fused_kernel");
+                g_use_fused = g_fused_pipeline.valid();
+                if (g_use_fused) {
+                    fprintf(stderr, "[Metal] Fused BIP-352 kernel available\n");
+                    compute_bip352_midstate(g_bip352_midstate);
+                } else {
+                    fprintf(stderr, "[Metal] Fused kernel unavailable, using multi-dispatch fallback\n");
+                }
             }
         }
         g_metal_initialized = true;
@@ -160,15 +214,30 @@ void *UfsecpMetalLaunchBatch(const uint8_t *scan_key, const uint8_t *tweak_data,
 
     auto *state = new UfsecpMetalBatchState();
     state->count = count;
+    state->use_fused = g_use_fused;
 
-    // Convert scan key (LE bytes -> Metal HostScalar), replicate for batch API
-    mtl::HostScalar scan_scalar = scalar_from_le(scan_key);
-    state->scan_scalars.resize(count, scan_scalar);
+    if (state->use_fused) {
+        // Fused path: copy raw LE bytes directly into Metal buffers (no conversion)
+        state->tweak_buf = g_runtime->alloc_buffer(count * 64);
+        state->scan_key_buf = g_runtime->alloc_buffer(32);
+        state->out_x_buf = g_runtime->alloc_buffer(count * 32);
+        state->out_y_buf = g_runtime->alloc_buffer(count * 32);
+        state->midstate_buf = g_runtime->alloc_buffer(8 * sizeof(uint32_t));
+        state->count_buf = g_runtime->alloc_buffer(sizeof(uint32_t));
 
-    // Convert tweak points (N x 64 LE bytes -> Metal HostAffinePoints)
-    state->tweak_points.resize(count);
-    for (uint32_t i = 0; i < count; i++)
-        state->tweak_points[i] = affine_from_le(tweak_data + i * 64);
+        std::memcpy(state->tweak_buf.contents(), tweak_data, count * 64);
+        std::memcpy(state->scan_key_buf.contents(), scan_key, 32);
+        std::memcpy(state->midstate_buf.contents(), g_bip352_midstate, 8 * sizeof(uint32_t));
+        state->count_buf.write(&count, 1);
+    } else {
+        // Multi-dispatch fallback: convert to host types
+        mtl::HostScalar scan_scalar = scalar_from_le(scan_key);
+        state->scan_scalars.resize(count, scan_scalar);
+
+        state->tweak_points.resize(count);
+        for (uint32_t i = 0; i < count; i++)
+            state->tweak_points[i] = affine_from_le(tweak_data + i * 64);
+    }
 
     return state;
 }
@@ -177,6 +246,32 @@ int UfsecpMetalRunKernels(void *state_handle, uint8_t *out_x, uint8_t *out_y, ui
     auto *state = static_cast<UfsecpMetalBatchState *>(state_handle);
     if (!state || !g_runtime)
         return -1;
+
+    // ====================================================================
+    // Fused path: single GPU dispatch
+    // ====================================================================
+    if (state->use_fused) {
+        uint32_t tg = g_fused_pipeline.threadExecutionWidth();
+        if (tg == 0) tg = 256;
+
+        {
+            std::lock_guard<std::mutex> lock(g_metal_mutex);
+            std::vector<mtl::MetalBuffer *> bufs = {
+                &state->tweak_buf, &state->scan_key_buf,
+                &state->out_x_buf, &state->out_y_buf,
+                &state->midstate_buf, &state->count_buf
+            };
+            g_runtime->dispatch_sync(g_fused_pipeline, state->count, tg, bufs);
+        }
+
+        std::memcpy(out_x, state->out_x_buf.contents(), state->count * 32);
+        std::memcpy(out_y, state->out_y_buf.contents(), state->count * 32);
+        return 0;
+    }
+
+    // ====================================================================
+    // Multi-dispatch fallback path
+    // ====================================================================
 
     // Compute tag midstate once (thread-safe: worst case is redundant computation)
     if (!g_tag_computed) {
