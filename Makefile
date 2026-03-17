@@ -11,6 +11,9 @@ endif
 ifdef UFSECP_ENABLE_OPENCL
 EXT_FLAGS += -DUFSECP_ENABLE_OPENCL=$(UFSECP_ENABLE_OPENCL)
 endif
+ifdef UFSECP_ENABLE_METAL
+EXT_FLAGS += -DUFSECP_ENABLE_METAL=$(UFSECP_ENABLE_METAL)
+endif
 
 # Include the Makefile from extension-ci-tools
 include extension-ci-tools/makefiles/duckdb_extension.Makefile

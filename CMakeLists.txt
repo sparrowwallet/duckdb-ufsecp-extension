@@ -10,6 +10,7 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 # --- GPU toggles (default OFF, can be combined) ---
 option(UFSECP_ENABLE_CUDA "Build with CUDA GPU acceleration" OFF)
 option(UFSECP_ENABLE_OPENCL "Build with OpenCL GPU acceleration" OFF)
+option(UFSECP_ENABLE_METAL "Build with Metal GPU acceleration (macOS)" OFF)
 
 if(UFSECP_ENABLE_CUDA)
     include(CheckLanguage)
@@ -35,6 +36,23 @@ if(UFSECP_ENABLE_OPENCL)
     else()
         message(WARNING "UFSECP_ENABLE_OPENCL=ON but OpenCL not found. Building CPU-only.")
         set(UFSECP_ENABLE_OPENCL OFF)
+    endif()
+endif()
+
+if(UFSECP_ENABLE_METAL)
+    if(APPLE)
+        enable_language(OBJCXX)
+        find_library(METAL_FRAMEWORK Metal)
+        find_library(FOUNDATION_FRAMEWORK Foundation)
+        if(METAL_FRAMEWORK AND FOUNDATION_FRAMEWORK)
+            message(STATUS "ufsecp: Metal enabled")
+        else()
+            message(WARNING "UFSECP_ENABLE_METAL=ON but Metal framework not found. Building CPU-only.")
+            set(UFSECP_ENABLE_METAL OFF)
+        endif()
+    else()
+        message(WARNING "UFSECP_ENABLE_METAL=ON on non-Apple platform. Building CPU-only.")
+        set(UFSECP_ENABLE_METAL OFF)
     endif()
 endif()
 
@@ -69,6 +87,12 @@ else()
     set(SECP256K1_BUILD_OPENCL OFF CACHE BOOL "" FORCE)
 endif()
 
+if(UFSECP_ENABLE_METAL)
+    set(SECP256K1_BUILD_METAL ON CACHE BOOL "" FORCE)
+else()
+    set(SECP256K1_BUILD_METAL OFF CACHE BOOL "" FORCE)
+endif()
+
 add_subdirectory(UltrafastSecp256k1)
 
 include_directories(src/include)
@@ -85,6 +109,11 @@ if(UFSECP_ENABLE_OPENCL)
     include_directories(UltrafastSecp256k1/opencl/include)
     include_directories(UltrafastSecp256k1/include)
 endif()
+if(UFSECP_ENABLE_METAL)
+    list(APPEND EXTENSION_SOURCES src/ufsecp_gpu_metal.mm)
+    include_directories(UltrafastSecp256k1/metal/include)
+    include_directories(UltrafastSecp256k1/include)
+endif()
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
@@ -96,6 +125,9 @@ if(UFSECP_ENABLE_CUDA)
 endif()
 if(UFSECP_ENABLE_OPENCL)
     list(APPEND UFSECP_LIBS secp256k1_opencl ${OpenCL_LIBRARY})
+endif()
+if(UFSECP_ENABLE_METAL)
+    list(APPEND UFSECP_LIBS secp256k1_metal_lib ${METAL_FRAMEWORK} ${FOUNDATION_FRAMEWORK})
 endif()
 
 target_link_libraries(${EXTENSION_NAME} ${UFSECP_LIBS})
@@ -126,9 +158,42 @@ if(UFSECP_ENABLE_OPENCL)
     target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE UFSECP_OPENCL_ENABLED UFSECP_GPU_ENABLED)
 endif()
 
+if(UFSECP_ENABLE_METAL)
+    # Generate embedded shader source header
+    set(METAL_SHADER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/UltrafastSecp256k1/metal/shaders)
+    add_custom_command(
+        OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/metal_shader_source.h
+        COMMAND ${CMAKE_COMMAND}
+            -DSHADER_DIR=${METAL_SHADER_DIR}
+            -DOUTPUT_FILE=${CMAKE_CURRENT_BINARY_DIR}/metal_shader_source.h
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_metal_shaders.cmake
+        DEPENDS
+            ${METAL_SHADER_DIR}/secp256k1_field.h
+            ${METAL_SHADER_DIR}/secp256k1_point.h
+            ${METAL_SHADER_DIR}/secp256k1_bloom.h
+            ${METAL_SHADER_DIR}/secp256k1_extended.h
+            ${METAL_SHADER_DIR}/secp256k1_hash160.h
+            ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_metal_shaders.cmake
+        COMMENT "Embedding Metal shader source into header"
+    )
+    add_custom_target(metal_shader_header DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/metal_shader_source.h)
+    add_dependencies(${EXTENSION_NAME} metal_shader_header)
+    add_dependencies(${LOADABLE_EXTENSION_NAME} metal_shader_header)
+    target_include_directories(${EXTENSION_NAME} PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+    target_include_directories(${LOADABLE_EXTENSION_NAME} PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+
+    target_compile_definitions(${EXTENSION_NAME} PRIVATE UFSECP_METAL_ENABLED UFSECP_GPU_ENABLED)
+    target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE UFSECP_METAL_ENABLED UFSECP_GPU_ENABLED)
+    target_compile_options(${EXTENSION_NAME} PRIVATE $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)
+    target_compile_options(${LOADABLE_EXTENSION_NAME} PRIVATE $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)
+endif()
+
 set(INSTALL_TARGETS ${EXTENSION_NAME} fastsecp256k1)
 if(UFSECP_ENABLE_OPENCL)
     list(APPEND INSTALL_TARGETS secp256k1_opencl)
+endif()
+if(UFSECP_ENABLE_METAL)
+    list(APPEND INSTALL_TARGETS secp256k1_metal_lib)
 endif()
 
 install(

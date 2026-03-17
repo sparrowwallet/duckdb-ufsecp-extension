@@ -46,7 +46,7 @@ static bool g_tag_computed = false;
 
 struct UfsecpOclBatchState {
 	std::vector<ocl::Scalar> scan_scalars;      // N copies of scan_scalar
-	std::vector<ocl::AffinePoint> tweak_points;  // N affine points from input
+	std::vector<ocl::AffinePoint> tweak_points; // N affine points from input
 	uint32_t count;
 };
 

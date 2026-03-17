@@ -41,6 +41,14 @@ int UfsecpOclRunKernels(void *state_handle, uint8_t *out_x, uint8_t *out_y, uint
 void UfsecpOclFreeBatch(void *state_handle);
 }
 #endif
+#ifdef UFSECP_METAL_ENABLED
+extern "C" {
+int UfsecpMetalDetect(int *num_gpus);
+void *UfsecpMetalLaunchBatch(const uint8_t *scan_key, const uint8_t *tweak_data, uint32_t count, int device_id);
+int UfsecpMetalRunKernels(void *state_handle, uint8_t *out_x, uint8_t *out_y, uint32_t count);
+void UfsecpMetalFreeBatch(void *state_handle);
+}
+#endif
 
 namespace duckdb {
 
@@ -55,7 +63,7 @@ using secp256k1::fast::Scalar;
 // ============================================================================
 
 #ifdef UFSECP_GPU_ENABLED
-enum class GpuBackend { NONE, CUDA, OPENCL };
+enum class GpuBackend { NONE, CUDA, OPENCL, METAL };
 
 static GpuBackend g_gpu_backend = GpuBackend::NONE;
 static int g_num_gpus = 0;
@@ -74,7 +82,7 @@ static void EnsureGpuDetected() {
 	if (g_gpu_detected)
 		return;
 
-	// Try CUDA first (higher performance), then OpenCL
+		// Try CUDA first (higher performance), then OpenCL
 #ifdef UFSECP_CUDA_ENABLED
 	{
 		int cuda_gpus = 0;
@@ -100,6 +108,21 @@ static void EnsureGpuDetected() {
 			g_gpu_launch = UfsecpOclLaunchBatch;
 			g_gpu_run = UfsecpOclRunKernels;
 			g_gpu_free = UfsecpOclFreeBatch;
+			g_gpu_detected = true;
+			return;
+		}
+	}
+#endif
+#ifdef UFSECP_METAL_ENABLED
+	{
+		int metal_gpus = 0;
+		UfsecpMetalDetect(&metal_gpus);
+		if (metal_gpus > 0) {
+			g_num_gpus = metal_gpus;
+			g_gpu_backend = GpuBackend::METAL;
+			g_gpu_launch = UfsecpMetalLaunchBatch;
+			g_gpu_run = UfsecpMetalRunKernels;
+			g_gpu_free = UfsecpMetalFreeBatch;
 			g_gpu_detected = true;
 			return;
 		}
@@ -908,6 +931,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 			    backend_str = "cuda (" + std::to_string(g_num_gpus) + " device" + (g_num_gpus > 1 ? "s" : "") + ")";
 		    } else if (g_gpu_backend == GpuBackend::OPENCL) {
 			    backend_str = "opencl (" + std::to_string(g_num_gpus) + " device" + (g_num_gpus > 1 ? "s" : "") + ")";
+		    } else if (g_gpu_backend == GpuBackend::METAL) {
+			    backend_str = "metal (" + std::to_string(g_num_gpus) + " device" + (g_num_gpus > 1 ? "s" : "") + ")";
 		    } else {
 			    backend_str = "cpu (GPU compiled, no GPU detected)";
 		    }
