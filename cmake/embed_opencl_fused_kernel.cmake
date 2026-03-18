@@ -32,8 +32,100 @@ foreach(FILE ${KERNEL_FILES})
     string(APPEND COMBINED "${CONTENT}\n")
 endforeach()
 
-# Append fused BIP-352 kernel definition
+# Append precomputed generator tables, helpers, and fused kernel
 string(APPEND COMBINED "
+// =============================================================================
+// Precomputed generator nibble tables for GLV generator multiplication
+// =============================================================================
+// GENERATOR_TABLE_NIBBLE[i] = i*G  (i=0..15)
+// GENERATOR_TABLE_NIBBLE_PHI[i] = phi(i*G) where phi is the GLV endomorphism
+
+__constant AffinePoint GENERATOR_TABLE_NIBBLE[16] = {
+    {{{0x0000000000000000UL,0x0000000000000000UL,0x0000000000000000UL,0x0000000000000000UL}},{{0x0000000000000000UL,0x0000000000000000UL,0x0000000000000000UL,0x0000000000000000UL}}},
+    {{{0x59f2815b16f81798UL,0x029bfcdb2dce28d9UL,0x55a06295ce870b07UL,0x79be667ef9dcbbacUL}},{{0x9c47d08ffb10d4b8UL,0xfd17b448a6855419UL,0x5da4fbfc0e1108a8UL,0x483ada7726a3c465UL}}},
+    {{{0xabac09b95c709ee5UL,0x5c778e4b8cef3ca7UL,0x3045406e95c07cd8UL,0xc6047f9441ed7d6dUL}},{{0x236431a950cfe52aUL,0xf7f632653266d0e1UL,0xa3c58419466ceaeeUL,0x1ae168fea63dc339UL}}},
+    {{{0x8601f113bce036f9UL,0xb531c845836f99b0UL,0x49344f85f89d5229UL,0xf9308a019258c310UL}},{{0x6cb9fd7584b8e672UL,0x6500a99934c2231bUL,0x0fe337e62a37f356UL,0x388f7b0f632de814UL}}},
+    {{{0x74fa94abe8c4cd13UL,0xcc6c13900ee07584UL,0x581e4904930b1404UL,0xe493dbf1c10d80f3UL}},{{0xcfe97bdc47739922UL,0xd967ae33bfbdfe40UL,0x5642e2098ea51448UL,0x51ed993ea0d455b7UL}}},
+    {{{0xcba8d569b240efe4UL,0xe88b84bddc619ab7UL,0x55b4a7250a5c5128UL,0x2f8bde4d1a072093UL}},{{0xdca87d3aa6ac62d6UL,0xf788271bab0d6840UL,0xd4dba9dda6c9c426UL,0xd8ac222636e5e3d6UL}}},
+    {{{0x2f057a1460297556UL,0x82f6472f8568a18bUL,0x20453a14355235d3UL,0xfff97bd5755eeea4UL}},{{0x3c870c36b075f297UL,0xde80f0f6518fe4a0UL,0xf3be96017f45c560UL,0xae12777aacfbb620UL}}},
+    {{{0xe92bddedcac4f9bcUL,0x3d419b7e0330e39cUL,0xa398f365f2ea7a0eUL,0x5cbdf0646e5db4eaUL}},{{0xa5082628087264daUL,0xa813d0b813fde7b5UL,0xa3178d6d861a54dbUL,0x6aebca40ba255960UL}}},
+    {{{0x67784ef3e10a2a01UL,0x0a1bdd05e5af888aUL,0xaff3843fb70f3c2fUL,0x2f01e5e15cca351dUL}},{{0xb5da2cb76cbde904UL,0xc2e213d6ba5b7617UL,0x293d082a132d13b4UL,0x5c4da8a741539949UL}}},
+    {{{0xc35f110dfc27ccbeUL,0xe09796974c57e714UL,0x09ad178a9f559abdUL,0xacd484e2f0c7f653UL}},{{0x05cc262ac64f9c37UL,0xadd888a4375f8e0fUL,0x64380971763b61e9UL,0xcc338921b0a7d9fdUL}}},
+    {{{0x52a68e2a47e247c7UL,0x3442d49b1943c2b7UL,0x35477c7b1ae6ae5dUL,0xa0434d9e47f3c862UL}},{{0x3cbee53b037368d7UL,0x6f794c2ed877a159UL,0xa3b6c7e693a24c69UL,0x893aba425419bc27UL}}},
+    {{{0xbbec17895da008cbUL,0x5649980be5c17891UL,0x5ef4246b70c65aacUL,0x774ae7f858a9411eUL}},{{0x301d74c9c953c61bUL,0x372db1e2dff9d6a8UL,0x0243dd56d7b7b365UL,0xd984a032eb6b5e19UL}}},
+    {{{0xc5b0f47070afe85aUL,0x687cf4419620095bUL,0x15c38f004d734633UL,0xd01115d548e7561bUL}},{{0x6b051b13f4062327UL,0x79238c5dd9a86d52UL,0xa8b64537e17bd815UL,0xa9f34ffdc815e0d7UL}}},
+    {{{0xdeeddf8f19405aa8UL,0xb075fbc6610e58cdUL,0xc7d1d205c3748651UL,0xf28773c2d975288bUL}},{{0x29b5cb52db03ed81UL,0x3a1a06da521fa91fUL,0x758212eb65cdaf47UL,0x0ab0902e8d880a89UL}}},
+    {{{0xe49b241a60e823e4UL,0x26aa7b63678949e6UL,0xfd64e67f07d38e32UL,0x499fdf9e895e719cUL}},{{0xc65f40d403a13f5bUL,0x464279c27a3f95bcUL,0x90f044e4a7b3d464UL,0xcac2f6c4b54e8551UL}}},
+    {{{0x44adbcf8e27e080eUL,0x31e5946f3c85f79eUL,0x5a465ae3095ff411UL,0xd7924d4f7d43ea96UL}},{{0xc504dc9ff6a26b58UL,0xea40af2bd896d3a5UL,0x83842ec228cc6defUL,0x581e2872a86c72a6UL}}}
+};
+
+__constant AffinePoint GENERATOR_TABLE_NIBBLE_PHI[16] = {
+    {{{0x0000000000000000UL,0x0000000000000000UL,0x0000000000000000UL,0x0000000000000000UL}},{{0x0000000000000000UL,0x0000000000000000UL,0x0000000000000000UL,0x0000000000000000UL}}},
+    {{{0xa7bba04400b88fcbUL,0x872844067f15e98dUL,0xab0102b696902325UL,0xbcace2e99da01887UL}},{{0x9c47d08ffb10d4b8UL,0xfd17b448a6855419UL,0x5da4fbfc0e1108a8UL,0x483ada7726a3c465UL}}},
+    {{{0x3e995b6ed89250e1UL,0xd2fad8cce43837efUL,0x4135ee7d59f87b33UL,0xc360a6d0b34ce6dfUL}},{{0x236431a950cfe52aUL,0xf7f632653266d0e1UL,0xa3c58419466ceaeeUL,0x1ae168fea63dc339UL}}},
+    {{{0xf7f0728c77206b2fUL,0x8af1e022c6dc8e1cUL,0x8dcd8dcf2a28fa2fUL,0xdf6edf03731f9b4bUL}},{{0x6cb9fd7584b8e672UL,0x6500a99934c2231bUL,0x0fe337e62a37f356UL,0x388f7b0f632de814UL}}},
+    {{{0x5bde5b333b306100UL,0x714c30b5ab487127UL,0x5c45faf8b90e324bUL,0x1b77921f0d382907UL}},{{0xcfe97bdc47739922UL,0xd967ae33bfbdfe40UL,0x5642e2098ea51448UL,0x51ed993ea0d455b7UL}}},
+    {{{0x138c694695a83668UL,0xa045693ee0d097ccUL,0xf79f54fbccb94671UL,0x337b52e3acda49dfUL}},{{0xdca87d3aa6ac62d6UL,0xf788271bab0d6840UL,0xd4dba9dda6c9c426UL,0xd8ac222636e5e3d6UL}}},
+    {{{0x47aaf28078f38045UL,0x86649d3e56a15a68UL,0x5e3aa731e3e8bed7UL,0xe63bcdd9aa535fc6UL}},{{0x3c870c36b075f297UL,0xde80f0f6518fe4a0UL,0xf3be96017f45c560UL,0xae12777aacfbb620UL}}},
+    {{{0x3bc4686e4e53bc94UL,0x0d3b20e20faf7aaaUL,0xa4fec4d1c095c06eUL,0x13f26e754bea0b77UL}},{{0xa5082628087264daUL,0xa813d0b813fde7b5UL,0xa3178d6d861a54dbUL,0x6aebca40ba255960UL}}},
+    {{{0x03e947742446cc73UL,0xb4ff771524257657UL,0xaa77840f29e24892UL,0x47ab650342d401a7UL}},{{0xb5da2cb76cbde904UL,0xc2e213d6ba5b7617UL,0x293d082a132d13b4UL,0x5c4da8a741539949UL}}},
+    {{{0x20cd912e65953a52UL,0xb565cdf5ef6d44e1UL,0x7b6558afec58ab20UL,0x87b404037e44e819UL}},{{0x05cc262ac64f9c37UL,0xadd888a4375f8e0fUL,0x64380971763b61e9UL,0xcc338921b0a7d9fdUL}}},
+    {{{0xbdb3e957741afe29UL,0xc1938d8e083762e4UL,0xa136ebb246813990UL,0x26ce269bf7a397b1UL}},{{0x3cbee53b037368d7UL,0x6f794c2ed877a159UL,0xa3b6c7e693a24c69UL,0x893aba425419bc27UL}}},
+    {{{0xc5ff4334bb209ce7UL,0x79859bb70b5ff620UL,0x8d897c41bebf1a26UL,0x51f4d3d1171dac1dUL}},{{0x301d74c9c953c61bUL,0x372db1e2dff9d6a8UL,0x0243dd56d7b7b365UL,0xd984a032eb6b5e19UL}}},
+    {{{0x4a3eb52c042295e5UL,0xf9482837c9535355UL,0xac1548422eac82adUL,0x88591bfd953aac41UL}},{{0x6b051b13f4062327UL,0x79238c5dd9a86d52UL,0xa8b64537e17bd815UL,0xa9f34ffdc815e0d7UL}}},
+    {{{0x60aaee6a475fb678UL,0x32907ed74a3d0562UL,0x07046c4578fc783bUL,0xf14d58374bb890a2UL}},{{0x29b5cb52db03ed81UL,0x3a1a06da521fa91fUL,0x758212eb65cdaf47UL,0x0ab0902e8d880a89UL}}},
+    {{{0x0e6ab7ee20a0b458UL,0x580656a627c529f6UL,0x1548f0dc87c37384UL,0x7b1252177810048aUL}},{{0xc65f40d403a13f5bUL,0x464279c27a3f95bcUL,0x90f044e4a7b3d464UL,0xcac2f6c4b54e8551UL}}},
+    {{{0x3ac0a40c71b1b3b4UL,0x05cc3bc9c1c0a639UL,0x0e1b4825512b6948UL,0x805f1105f5f9454aUL}},{{0xc504dc9ff6a26b58UL,0xea40af2bd896d3a5UL,0x83842ec228cc6defUL,0x581e2872a86c72a6UL}}}
+};
+
+// =============================================================================
+// Helpers for GLV generator multiplication
+// =============================================================================
+
+inline int get_window_4bit_fused(const Scalar* s, int pos) {
+    int bp = pos * 4, li = bp >> 6, sh = bp & 63;
+    ulong v = s->limbs[li] >> sh;
+    if (sh > 60 && li < 3) v |= s->limbs[li+1] << (64 - sh);
+    return (int)(v & 0xFUL);
+}
+
+// GLV generator multiplication using precomputed __constant nibble tables.
+// Replaces scalar_mul_generator_windowed_impl which builds tables at runtime.
+inline void scalar_mul_generator_glv(JacobianPoint* r, const Scalar* k) {
+    if ((k->limbs[0]|k->limbs[1]|k->limbs[2]|k->limbs[3]) == 0) {
+        point_set_infinity(r);
+        return;
+    }
+
+    Scalar k1, k2; int k1_neg, k2_neg;
+    glv_decompose_impl(k, &k1, &k2, &k1_neg, &k2_neg);
+
+    int bl1 = scalar_bitlen_impl(&k1);
+    int bl2 = scalar_bitlen_impl(&k2);
+    int max_bits = (bl1 > bl2) ? bl1 : bl2;
+    int num_windows = (max_bits + 3) / 4;
+
+    point_set_infinity(r);
+    for (int w = num_windows - 1; w >= 0; --w) {
+        if (!point_is_infinity(r)) {
+            point_double_impl(r, r); point_double_impl(r, r);
+            point_double_impl(r, r); point_double_impl(r, r);
+        }
+        int w1 = get_window_4bit_fused(&k1, w);
+        if (w1) {
+            AffinePoint pt = GENERATOR_TABLE_NIBBLE[w1];
+            if (k1_neg) field_neg_impl(&pt.y, &pt.y);
+            point_add_mixed_impl(r, r, &pt);
+        }
+        int w2 = get_window_4bit_fused(&k2, w);
+        if (w2) {
+            AffinePoint pt = GENERATOR_TABLE_NIBBLE_PHI[w2];
+            if (k2_neg) field_neg_impl(&pt.y, &pt.y);
+            point_add_mixed_impl(r, r, &pt);
+        }
+    }
+}
+
 // =============================================================================
 // Fused BIP-352 kernel -- entire per-row pipeline in one thread
 // =============================================================================
@@ -110,12 +202,12 @@ __kernel void bip352_fused_kernel(
     sha256_final(&ctx, hash);
 
     // ------------------------------------------------------------------
-    // Phase 4: output_point = hash * G
+    // Phase 4: output_point = hash * G (GLV + precomputed tables)
     // ------------------------------------------------------------------
     Scalar hs;
     scalar_from_bytes_impl(hash, &hs);
     JacobianPoint out_jac;
-    scalar_mul_generator_windowed_impl(&out_jac, &hs);
+    scalar_mul_generator_glv(&out_jac, &hs);
 
     AffinePoint out_aff;
     jacobian_to_affine_convert_impl(&out_aff,

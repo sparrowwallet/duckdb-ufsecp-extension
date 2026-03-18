@@ -129,10 +129,7 @@ __global__ void BIP352FusedKernel(
     field_to_bytes(&x_aff, shared_x);
 
     // Y parity → SEC1 prefix (0x02 = even, 0x03 = odd)
-    // field_to_bytes normalizes mod p; byte[31] is LSB → bit 0 is parity.
-    uint8_t y_bytes[32];
-    field_to_bytes(&y_aff, y_bytes);
-    uint8_t prefix = 0x02 + (y_bytes[31] & 1);
+    uint8_t prefix = field_is_odd(&y_aff) ? 0x03 : 0x02;
 
     // Build 37-byte buffer: [prefix || x_BE || 0x00000000]
     uint8_t serialized[37];
