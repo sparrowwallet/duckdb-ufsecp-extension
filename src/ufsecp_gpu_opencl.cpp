@@ -298,6 +298,10 @@ int UfsecpOclRunKernels(void *state_handle, uint8_t *out_x, uint8_t *out_y, uint
 	if (state->use_fused) {
 		auto *queue = static_cast<cl_command_queue>(g_ocl_ctx->native_queue());
 
+		// Lock around setargs + enqueue to prevent concurrent threads from
+		// interleaving kernel arguments on the shared cl_kernel object.
+		std::lock_guard<std::mutex> lock(g_ocl_mutex);
+
 		// Set kernel arguments
 		clSetKernelArg(g_fused_kernel, 0, sizeof(cl_mem), &state->tweak_buf);
 		clSetKernelArg(g_fused_kernel, 1, sizeof(cl_mem), &state->scan_key_buf);
