@@ -65,6 +65,106 @@ kernel void generator_mul_batch(
     results[tid] = jacobian_to_affine(jac);
 }
 
+// scalar_mul_generator_lut is defined in secp256k1_extended.h (included above)
+
+constant int GEN_LUT_N = 65536;
+constant int GEN_LUT_SLICES = 16;
+
+// =============================================================================
+// Generator LUT build kernels
+// =============================================================================
+
+// Kernel 1: Compute base points B_i = 2^(16*i) * G for i=0..15
+kernel void compute_lut_base_points(
+    device AffinePoint *bases    [[buffer(0)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid != 0) return;
+
+    bases[0] = generator_affine();
+
+    JacobianPoint p;
+    AffinePoint g = generator_affine();
+    p.x = g.x; p.y = g.y; p.z = field_one(); p.infinity = 0;
+
+    for (int i = 1; i < GEN_LUT_SLICES; i++) {
+        for (int d = 0; d < 16; d++)
+            p = jacobian_double(p);
+
+        AffinePoint aff = jacobian_to_affine(p);
+        bases[i] = aff;
+
+        p.x = aff.x; p.y = aff.y; p.z = field_one(); p.infinity = 0;
+    }
+}
+
+// Kernel 2: Build LUT entries via sequential chain + serial inversion
+// One threadgroup per slice, 1 thread each.
+kernel void gen_lut_build_affine(
+    device const AffinePoint *bases      [[buffer(0)]],
+    device AffinePoint *aff_table        [[buffer(1)]],
+    device FieldElement *h_buf           [[buffer(2)]],
+    constant int &n_entries              [[buffer(3)]],
+    uint slice [[threadgroup_position_in_grid]])
+{
+    if (slice >= (uint)GEN_LUT_SLICES) return;
+
+    int offset = int(slice) * n_entries;
+    device FieldElement *h = h_buf + int(slice) * n_entries;
+
+    aff_table[offset].x = field_zero();
+    aff_table[offset].y = field_zero();
+
+    aff_table[offset + 1] = bases[slice];
+
+    AffinePoint base = bases[slice];
+    JacobianPoint acc;
+    acc.x = base.x; acc.y = base.y; acc.z = field_one(); acc.infinity = 0;
+
+    for (int j = 2; j < n_entries; j++) {
+        FieldElement h_val;
+        acc = jacobian_add_mixed_h(acc, base, h_val);
+        h[j - 2] = h_val;
+        aff_table[offset + j].x = acc.x;
+        aff_table[offset + j].y = acc.y;
+    }
+
+    FieldElement z_inv = field_inv(acc.z);
+
+    for (int j = n_entries - 1; j >= 2; --j) {
+        FieldElement h_save;
+        if (j > 2) h_save = h[j - 2];
+        h[j - 2] = z_inv;
+        if (j > 2) z_inv = field_mul(h_save, z_inv);
+    }
+}
+
+// Kernel 3: Parallel affine conversion using precomputed Z^{-1}
+kernel void gen_lut_convert_zinv(
+    device AffinePoint *aff_table        [[buffer(0)]],
+    device const FieldElement *h_buf     [[buffer(1)]],
+    constant int &n_entries              [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    int per_slice = n_entries - 2;
+    int total = GEN_LUT_SLICES * per_slice;
+    if (gid >= (uint)total) return;
+
+    int slice = int(gid) / per_slice;
+    int j = (int(gid) % per_slice) + 2;
+    int offset = slice * n_entries;
+    device const FieldElement *h = h_buf + slice * n_entries;
+
+    FieldElement zi = h[j - 2];
+    FieldElement z_inv2 = field_sqr(zi);
+    FieldElement z_inv3 = field_mul(zi, z_inv2);
+
+    FieldElement px = aff_table[offset + j].x;
+    FieldElement py = aff_table[offset + j].y;
+    aff_table[offset + j].x = field_mul(px, z_inv2);
+    aff_table[offset + j].y = field_mul(py, z_inv3);
+}
+
 // =============================================================================
 // Precomputed generator nibble tables for GLV generator multiplication
 // =============================================================================
@@ -245,6 +345,94 @@ kernel void bip352_fused_kernel(
     // Phase 5: Write output as LE bytes
     // ------------------------------------------------------------------
     // field_to_bytes gives big-endian; reverse to LE wire format
+    uchar ox_be[32], oy_be[32];
+    field_to_bytes(out_aff.x, ox_be);
+    field_to_bytes(out_aff.y, oy_be);
+
+    device uchar *dst_x = out_x + tid * 32;
+    device uchar *dst_y = out_y + tid * 32;
+    for (int i = 0; i < 32; i++) {
+        dst_x[i] = ox_be[31 - i];
+        dst_y[i] = oy_be[31 - i];
+    }
+}
+
+// =============================================================================
+// Fused BIP-352 kernel with LUT -- entire per-row pipeline in one thread
+// =============================================================================
+
+kernel void bip352_fused_kernel_lut(
+    device const uchar *tweak_xy     [[buffer(0)]],
+    constant uchar *scan_key         [[buffer(1)]],
+    device uchar *out_x              [[buffer(2)]],
+    device uchar *out_y              [[buffer(3)]],
+    constant uint *tag_midstate      [[buffer(4)]],
+    constant uint &count             [[buffer(5)]],
+    device const AffinePoint *gen_lut [[buffer(6)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= count) return;
+
+    // ------------------------------------------------------------------
+    // Phase 0: Load inputs (LE wire format -> internal representation)
+    // ------------------------------------------------------------------
+    device const uchar *tweak = tweak_xy + tid * 64;
+    FieldElement fx, fy;
+    for (int i = 0; i < 8; i++) {
+        int base = i * 4;
+        fx.limbs[i] = (uint(tweak[base]) | (uint(tweak[base+1]) << 8) |
+                       (uint(tweak[base+2]) << 16) | (uint(tweak[base+3]) << 24));
+        fy.limbs[i] = (uint(tweak[32 + base]) | (uint(tweak[32 + base+1]) << 8) |
+                       (uint(tweak[32 + base+2]) << 16) | (uint(tweak[32 + base+3]) << 24));
+    }
+    AffinePoint tweak_pt;
+    tweak_pt.x = fx;
+    tweak_pt.y = fy;
+
+    uchar sk_be[32];
+    for (int i = 0; i < 32; i++) sk_be[i] = scan_key[31 - i];
+    Scalar256 sk = scalar_from_bytes(sk_be);
+
+    // ------------------------------------------------------------------
+    // Phase 1: shared_secret = scan_key * tweak_point
+    // ------------------------------------------------------------------
+    JacobianPoint shared_jac = scalar_mul_glv(tweak_pt, sk);
+    AffinePoint shared_aff = jacobian_to_affine(shared_jac);
+
+    // ------------------------------------------------------------------
+    // Phase 2: Jacobian -> affine -> SEC1 compressed serialization
+    // ------------------------------------------------------------------
+    uchar x_bytes[32], y_bytes[32];
+    field_to_bytes(shared_aff.x, x_bytes);
+    field_to_bytes(shared_aff.y, y_bytes);
+
+    uchar ser[37];
+    ser[0] = (y_bytes[31] & 1) ? 0x03 : 0x02;
+    for (int i = 0; i < 32; i++) ser[i + 1] = x_bytes[i];
+    ser[33] = 0; ser[34] = 0; ser[35] = 0; ser[36] = 0;
+
+    // ------------------------------------------------------------------
+    // Phase 3: Tagged SHA-256 with BIP0352/SharedSecret midstate
+    // ------------------------------------------------------------------
+    SHA256Ctx ctx;
+    for (int i = 0; i < 8; i++) ctx.h[i] = tag_midstate[i];
+    ctx.buf_len = 0;
+    ctx.total_len_lo = 64;
+    ctx.total_len_hi = 0;
+    sha256_update(ctx, ser, 37);
+    uchar hash[32];
+    sha256_final(ctx, hash);
+
+    // ------------------------------------------------------------------
+    // Phase 4: output_point = hash * G (LUT: 15 additions, 0 doublings)
+    // ------------------------------------------------------------------
+    Scalar256 hs = scalar_from_bytes(hash);
+    JacobianPoint out_jac = scalar_mul_generator_lut(hs, gen_lut);
+    AffinePoint out_aff = jacobian_to_affine(out_jac);
+
+    // ------------------------------------------------------------------
+    // Phase 5: Write output as LE bytes
+    // ------------------------------------------------------------------
     uchar ox_be[32], oy_be[32];
     field_to_bytes(out_aff.x, ox_be);
     field_to_bytes(out_aff.y, oy_be);

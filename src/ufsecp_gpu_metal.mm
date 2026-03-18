@@ -57,6 +57,29 @@ static bool g_tag_computed = false;
 static uint32_t g_bip352_midstate[8];
 
 // ============================================================================
+// Generator LUT state (64 MB precomputed table for k*G)
+// ============================================================================
+
+static constexpr int GEN_LUT_N = 65536;
+static constexpr int GEN_LUT_SLICES = 16;
+static constexpr int GEN_LUT_TOTAL = GEN_LUT_SLICES * GEN_LUT_N;
+static constexpr int AFFINE_POINT_SIZE = 64;
+static constexpr int FIELD_ELEMENT_SIZE = 32;
+
+static mtl::MetalBuffer g_gen_lut_buf;
+static bool g_lut_built = false;
+static bool g_lut_available = false;
+static std::mutex g_lut_mutex;
+
+// LUT build pipelines
+static mtl::ComputePipeline g_lut_base_pipeline;
+static mtl::ComputePipeline g_lut_build_pipeline;
+static mtl::ComputePipeline g_lut_convert_pipeline;
+
+// LUT fused kernel pipeline
+static mtl::ComputePipeline g_fused_lut_pipeline;
+
+// ============================================================================
 // Per-batch state (allocated in LaunchBatch, freed in FreeBatch)
 // ============================================================================
 
@@ -168,6 +191,73 @@ static void compute_bip352_midstate(uint32_t out[8]) {
 }
 
 // ============================================================================
+// Lazy LUT construction (called once on first kernel dispatch)
+// ============================================================================
+
+static void EnsureGenLutBuilt() {
+    if (g_lut_built) return;
+    std::lock_guard<std::mutex> lock(g_lut_mutex);
+    if (g_lut_built) return;
+
+    if (!g_lut_base_pipeline.valid() || !g_lut_build_pipeline.valid() ||
+        !g_lut_convert_pipeline.valid() || !g_fused_lut_pipeline.valid()) {
+        g_lut_built = true;
+        return;
+    }
+
+    // Step 1: Compute 16 base points
+    auto bases_buf = g_runtime->alloc_buffer(GEN_LUT_SLICES * AFFINE_POINT_SIZE);
+    {
+        std::lock_guard<std::mutex> mlock(g_metal_mutex);
+        std::vector<mtl::MetalBuffer *> bufs = {&bases_buf};
+        g_runtime->dispatch_sync(g_lut_base_pipeline, 1, 1, bufs);
+    }
+
+    // Step 2: Allocate LUT (64 MB) + temp H buffer (32 MB)
+    auto lut_buf = g_runtime->alloc_buffer(
+        (size_t)GEN_LUT_TOTAL * AFFINE_POINT_SIZE);
+    auto h_buf = g_runtime->alloc_buffer(
+        (size_t)GEN_LUT_TOTAL * FIELD_ELEMENT_SIZE);
+    auto n_buf = g_runtime->alloc_buffer(sizeof(int));
+
+    if (!lut_buf.valid() || !h_buf.valid()) {
+        g_lut_built = true;
+        return;
+    }
+
+    int n_entries = GEN_LUT_N;
+    n_buf.write(&n_entries, 1);
+
+    // Step 3: Build chain + serial inversion (16 threadgroups x 1 thread)
+    {
+        std::lock_guard<std::mutex> mlock(g_metal_mutex);
+        std::vector<mtl::MetalBuffer *> bufs = {
+            &bases_buf, &lut_buf, &h_buf, &n_buf};
+        g_runtime->dispatch_sync(
+            g_lut_build_pipeline, GEN_LUT_SLICES, 1, bufs);
+    }
+
+    // Step 4: Parallel affine conversion
+    int conv_total = GEN_LUT_SLICES * (GEN_LUT_N - 2);
+    uint32_t tg = g_lut_convert_pipeline.threadExecutionWidth();
+    if (tg == 0) tg = 256;
+    {
+        std::lock_guard<std::mutex> mlock(g_metal_mutex);
+        std::vector<mtl::MetalBuffer *> bufs = {&lut_buf, &h_buf, &n_buf};
+        g_runtime->dispatch_sync(
+            g_lut_convert_pipeline, conv_total, tg, bufs);
+    }
+
+    // Publish
+    g_gen_lut_buf = std::move(lut_buf);
+    g_lut_available = true;
+    g_lut_built = true;
+
+    fprintf(stderr, "[Metal] Generator LUT built (%d MB)\n",
+            (int)((size_t)GEN_LUT_TOTAL * AFFINE_POINT_SIZE / (1024 * 1024)));
+}
+
+// ============================================================================
 // Extern "C" interface -- same signatures as ufsecp_gpu_opencl.cpp
 // ============================================================================
 
@@ -196,8 +286,15 @@ int UfsecpMetalDetect(int *num_gpus) {
                     fprintf(stderr, "[Metal] Fused BIP-352 kernel available\n");
                     compute_bip352_midstate(g_bip352_midstate);
                 } else {
-                    fprintf(stderr, "[Metal] Fused kernel unavailable, using multi-dispatch fallback\n");
+                    fprintf(stderr,
+                        "[Metal] Fused kernel unavailable, using multi-dispatch fallback\n");
                 }
+
+                // LUT build pipelines (availability checked lazily)
+                g_lut_base_pipeline = g_runtime->make_pipeline("compute_lut_base_points");
+                g_lut_build_pipeline = g_runtime->make_pipeline("gen_lut_build_affine");
+                g_lut_convert_pipeline = g_runtime->make_pipeline("gen_lut_convert_zinv");
+                g_fused_lut_pipeline = g_runtime->make_pipeline("bip352_fused_kernel_lut");
             }
         }
         g_metal_initialized = true;
@@ -251,17 +348,31 @@ int UfsecpMetalRunKernels(void *state_handle, uint8_t *out_x, uint8_t *out_y, ui
     // Fused path: single GPU dispatch
     // ====================================================================
     if (state->use_fused) {
+        // Build LUT on first use (blocks until complete, thread-safe)
+        EnsureGenLutBuilt();
+
         uint32_t tg = g_fused_pipeline.threadExecutionWidth();
         if (tg == 0) tg = 256;
 
-        {
+        if (g_lut_available) {
+            std::lock_guard<std::mutex> lock(g_metal_mutex);
+            std::vector<mtl::MetalBuffer *> bufs = {
+                &state->tweak_buf, &state->scan_key_buf,
+                &state->out_x_buf, &state->out_y_buf,
+                &state->midstate_buf, &state->count_buf,
+                &g_gen_lut_buf
+            };
+            g_runtime->dispatch_sync(
+                g_fused_lut_pipeline, state->count, tg, bufs);
+        } else {
             std::lock_guard<std::mutex> lock(g_metal_mutex);
             std::vector<mtl::MetalBuffer *> bufs = {
                 &state->tweak_buf, &state->scan_key_buf,
                 &state->out_x_buf, &state->out_y_buf,
                 &state->midstate_buf, &state->count_buf
             };
-            g_runtime->dispatch_sync(g_fused_pipeline, state->count, tg, bufs);
+            g_runtime->dispatch_sync(
+                g_fused_pipeline, state->count, tg, bufs);
         }
 
         std::memcpy(out_x, state->out_x_buf.contents(), state->count * 32);
