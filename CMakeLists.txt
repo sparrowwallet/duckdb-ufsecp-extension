@@ -165,6 +165,7 @@ if(UFSECP_ENABLE_OPENCL)
         DEPENDS
             ${OPENCL_KERNEL_DIR}/secp256k1_field.cl
             ${OPENCL_KERNEL_DIR}/secp256k1_point.cl
+            ${OPENCL_KERNEL_DIR}/secp256k1_gen_table_w8.cl
             ${OPENCL_KERNEL_DIR}/secp256k1_extended.cl
             ${OPENCL_KERNEL_DIR}/secp256k1_affine.cl
             ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_opencl_fused_kernel.cmake

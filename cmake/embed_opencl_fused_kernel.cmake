@@ -4,13 +4,14 @@
 #   KERNEL_DIR  -- Path to UltrafastSecp256k1/opencl/kernels/
 #   OUTPUT_FILE -- Path to write opencl_fused_kernel_source.h
 #
-# Reads the 4 required kernel files (field, point, extended, affine),
-# strips #include and #pragma once lines, and appends the fused
-# bip352_fused_kernel definition. Writes the result as a C++ raw string literal.
+# Reads the required kernel files, strips #include and #pragma once lines,
+# and appends the fused BIP-352 kernels + LUT build kernels.
+# Writes the result as a C++ raw string literal.
 
 set(KERNEL_FILES
     "${KERNEL_DIR}/secp256k1_field.cl"
     "${KERNEL_DIR}/secp256k1_point.cl"
+    "${KERNEL_DIR}/secp256k1_gen_table_w8.cl"
     "${KERNEL_DIR}/secp256k1_extended.cl"
     "${KERNEL_DIR}/secp256k1_affine.cl"
 )
@@ -127,7 +128,7 @@ inline void scalar_mul_generator_glv(JacobianPoint* r, const Scalar* k) {
 }
 
 // =============================================================================
-// Fused BIP-352 kernel -- entire per-row pipeline in one thread
+// Fused BIP-352 kernel -- entire per-row pipeline in one thread (GLV fallback)
 // =============================================================================
 
 __kernel void bip352_fused_kernel(
@@ -141,11 +142,6 @@ __kernel void bip352_fused_kernel(
     uint gid = get_global_id(0);
     if (gid >= count) return;
 
-    // ------------------------------------------------------------------
-    // Phase 0: Load inputs (LE wire format -> internal representation)
-    // ------------------------------------------------------------------
-
-    // Load tweak point: LE bytes -> FieldElement (4x ulong LE limbs)
     __global const uchar *tweak = tweak_xy + gid * 64;
     FieldElement fx, fy;
     for (int i = 0; i < 4; i++) {
@@ -162,21 +158,14 @@ __kernel void bip352_fused_kernel(
     tweak_pt.x = fx;
     tweak_pt.y = fy;
 
-    // Load scan key: 32 LE bytes -> reverse to 32 BE bytes -> scalar_from_bytes
     uchar sk_be[32];
     for (int i = 0; i < 32; i++) sk_be[i] = scan_key[31 - i];
     Scalar sk;
     scalar_from_bytes_impl(sk_be, &sk);
 
-    // ------------------------------------------------------------------
-    // Phase 1: shared_secret = scan_key * tweak_point
-    // ------------------------------------------------------------------
     JacobianPoint shared_jac;
     scalar_mul_glv_impl(&shared_jac, &sk, &tweak_pt);
 
-    // ------------------------------------------------------------------
-    // Phase 2: Jacobian -> affine -> SEC1 compressed serialization
-    // ------------------------------------------------------------------
     AffinePoint shared_aff;
     jacobian_to_affine_convert_impl(&shared_aff,
         &shared_jac.x, &shared_jac.y, &shared_jac.z);
@@ -190,20 +179,14 @@ __kernel void bip352_fused_kernel(
     for (int i = 0; i < 32; i++) ser[i + 1] = x_bytes[i];
     ser[33] = 0; ser[34] = 0; ser[35] = 0; ser[36] = 0;
 
-    // ------------------------------------------------------------------
-    // Phase 3: Tagged SHA-256 with BIP0352/SharedSecret midstate
-    // ------------------------------------------------------------------
     SHA256Ctx ctx;
     for (int i = 0; i < 8; i++) ctx.h[i] = tag_midstate[i];
     ctx.buf_len = 0;
-    ctx.total_len = 64;  // 64 bytes already processed by midstate
+    ctx.total_len = 64;
     sha256_update(&ctx, ser, 37);
     uchar hash[32];
     sha256_final(&ctx, hash);
 
-    // ------------------------------------------------------------------
-    // Phase 4: output_point = hash * G (GLV + precomputed tables)
-    // ------------------------------------------------------------------
     Scalar hs;
     scalar_from_bytes_impl(hash, &hs);
     JacobianPoint out_jac;
@@ -213,9 +196,6 @@ __kernel void bip352_fused_kernel(
     jacobian_to_affine_convert_impl(&out_aff,
         &out_jac.x, &out_jac.y, &out_jac.z);
 
-    // ------------------------------------------------------------------
-    // Phase 5: Write output as LE bytes
-    // ------------------------------------------------------------------
     uchar ox_be[32], oy_be[32];
     field_to_bytes_impl(&out_aff.x, ox_be);
     field_to_bytes_impl(&out_aff.y, oy_be);
@@ -226,6 +206,208 @@ __kernel void bip352_fused_kernel(
         dst_x[i] = ox_be[31 - i];
         dst_y[i] = oy_be[31 - i];
     }
+}
+
+// =============================================================================
+// LUT-accelerated fused BIP-352 kernel
+// =============================================================================
+
+__kernel void bip352_fused_kernel_lut(
+    __global const uchar *tweak_xy,
+    __constant uchar *scan_key,
+    __global uchar *out_x,
+    __global uchar *out_y,
+    __constant uint *tag_midstate,
+    __global const AffinePoint *gen_lut,   // 16 x 65536 AffinePoints
+    const uint count
+) {
+    uint gid = get_global_id(0);
+    if (gid >= count) return;
+
+    __global const uchar *tweak = tweak_xy + gid * 64;
+    FieldElement fx, fy;
+    for (int i = 0; i < 4; i++) {
+        ulong lx = 0, ly = 0;
+        for (int j = 7; j >= 0; j--) {
+            lx = (lx << 8) | tweak[i * 8 + j];
+            ly = (ly << 8) | tweak[32 + i * 8 + j];
+        }
+        fx.limbs[i] = lx;
+        fy.limbs[i] = ly;
+    }
+
+    AffinePoint tweak_pt;
+    tweak_pt.x = fx;
+    tweak_pt.y = fy;
+
+    uchar sk_be[32];
+    for (int i = 0; i < 32; i++) sk_be[i] = scan_key[31 - i];
+    Scalar sk;
+    scalar_from_bytes_impl(sk_be, &sk);
+
+    JacobianPoint shared_jac;
+    scalar_mul_glv_impl(&shared_jac, &sk, &tweak_pt);
+
+    AffinePoint shared_aff;
+    jacobian_to_affine_convert_impl(&shared_aff,
+        &shared_jac.x, &shared_jac.y, &shared_jac.z);
+
+    uchar x_bytes[32], y_bytes[32];
+    field_to_bytes_impl(&shared_aff.x, x_bytes);
+    field_to_bytes_impl(&shared_aff.y, y_bytes);
+
+    uchar ser[37];
+    ser[0] = (y_bytes[31] & 1) ? 0x03 : 0x02;
+    for (int i = 0; i < 32; i++) ser[i + 1] = x_bytes[i];
+    ser[33] = 0; ser[34] = 0; ser[35] = 0; ser[36] = 0;
+
+    SHA256Ctx ctx;
+    for (int i = 0; i < 8; i++) ctx.h[i] = tag_midstate[i];
+    ctx.buf_len = 0;
+    ctx.total_len = 64;
+    sha256_update(&ctx, ser, 37);
+    uchar hash[32];
+    sha256_final(&ctx, hash);
+
+    // Phase 4: k*G via LUT (15 additions, 0 doublings)
+    Scalar hs;
+    scalar_from_bytes_impl(hash, &hs);
+    JacobianPoint out_jac;
+    scalar_mul_generator_lut_impl(&out_jac, &hs, gen_lut);
+
+    AffinePoint out_aff;
+    jacobian_to_affine_convert_impl(&out_aff,
+        &out_jac.x, &out_jac.y, &out_jac.z);
+
+    uchar ox_be[32], oy_be[32];
+    field_to_bytes_impl(&out_aff.x, ox_be);
+    field_to_bytes_impl(&out_aff.y, oy_be);
+
+    __global uchar *dst_x = out_x + gid * 32;
+    __global uchar *dst_y = out_y + gid * 32;
+    for (int i = 0; i < 32; i++) {
+        dst_x[i] = ox_be[31 - i];
+        dst_y[i] = oy_be[31 - i];
+    }
+}
+
+// =============================================================================
+// Generator LUT build kernels (16 x 65536 = 64 MB precomputed table)
+// =============================================================================
+
+#define GEN_LUT_SLICES  16
+#define GEN_LUT_N       65536
+
+// Single work-item: compute B_i = 2^(16*i) * G for i=0..15
+__kernel void compute_lut_base_points(__global AffinePoint* bases) {
+    // Copy G from __constant to private memory
+    AffinePoint g_local = GENERATOR_TABLE_W8[1];
+    bases[0] = g_local;
+
+    JacobianPoint p;
+    point_from_affine(&p, &g_local);
+
+    for (int i = 1; i < GEN_LUT_SLICES; i++) {
+        for (int d = 0; d < 16; d++)
+            point_double_impl(&p, &p);
+
+        FieldElement z_inv, z_inv2, z_inv3, ax, ay;
+        field_inv_impl(&z_inv, &p.z);
+        field_sqr_impl(&z_inv2, &z_inv);
+        field_mul_impl(&z_inv3, &z_inv, &z_inv2);
+        field_mul_impl(&ax, &p.x, &z_inv2);
+        field_mul_impl(&ay, &p.y, &z_inv3);
+        bases[i].x = ax;
+        bases[i].y = ay;
+
+        p.x = ax;
+        p.y = ay;
+        p.z.limbs[0] = 1UL; p.z.limbs[1] = 0; p.z.limbs[2] = 0; p.z.limbs[3] = 0;
+        p.infinity = 0;
+    }
+}
+
+// Fused LUT build + serial inversion (one work-item per slice).
+__kernel void gen_lut_build_affine_kernel(
+    __global const AffinePoint* bases,
+    __global AffinePoint* aff_table,
+    __global FieldElement* h_buf,
+    const int n_entries)
+{
+    int slice = get_global_id(0);
+    if (slice >= GEN_LUT_SLICES) return;
+
+    int offset = slice * n_entries;
+    __global FieldElement* h = h_buf + (long)slice * n_entries;
+
+    // [0] = identity
+    aff_table[offset].x.limbs[0] = 0; aff_table[offset].x.limbs[1] = 0;
+    aff_table[offset].x.limbs[2] = 0; aff_table[offset].x.limbs[3] = 0;
+    aff_table[offset].y.limbs[0] = 0; aff_table[offset].y.limbs[1] = 0;
+    aff_table[offset].y.limbs[2] = 0; aff_table[offset].y.limbs[3] = 0;
+
+    // [1] = base point
+    aff_table[offset + 1] = bases[slice];
+
+    // Forward pass
+    AffinePoint base_pt = bases[slice];
+    JacobianPoint acc;
+    point_from_affine(&acc, &base_pt);
+
+    for (int j = 2; j < n_entries; j++) {
+        FieldElement h_val;
+        point_add_mixed_h_impl(&acc, &acc, &base_pt, &h_val);
+        h[j - 2] = h_val;
+        aff_table[offset + j].x = acc.x;
+        aff_table[offset + j].y = acc.y;
+    }
+
+    // Single inversion of final Z
+    FieldElement z_inv;
+    field_inv_impl(&z_inv, &acc.z);
+
+    // Backward sweep
+    for (int j = n_entries - 1; j >= 2; --j) {
+        FieldElement h_save;
+        if (j > 2) h_save = h[j - 2];
+        h[j - 2] = z_inv;
+        if (j > 2) {
+            FieldElement tmp;
+            field_mul_impl(&tmp, &h_save, &z_inv);
+            z_inv = tmp;
+        }
+    }
+}
+
+// Parallel affine conversion using precomputed Z^{-1} from h_buf.
+__kernel void gen_lut_convert_zinv_kernel(
+    __global AffinePoint* aff_table,
+    __global const FieldElement* h_buf,
+    const int n_entries)
+{
+    int gid = get_global_id(0);
+    int per_slice = n_entries - 2;
+    int total = GEN_LUT_SLICES * per_slice;
+    if (gid >= total) return;
+
+    int slice = gid / per_slice;
+    int j = (gid % per_slice) + 2;
+    int offset = slice * n_entries;
+    __global const FieldElement* h = h_buf + (long)slice * n_entries;
+
+    FieldElement zi = h[j - 2];
+    FieldElement z_inv2, z_inv3;
+    field_sqr_impl(&z_inv2, &zi);
+    field_mul_impl(&z_inv3, &zi, &z_inv2);
+
+    // Copy from __global to private for field_mul_impl
+    FieldElement jx = aff_table[offset + j].x;
+    FieldElement jy = aff_table[offset + j].y;
+    FieldElement ax, ay;
+    field_mul_impl(&ax, &jx, &z_inv2);
+    field_mul_impl(&ay, &jy, &z_inv3);
+    aff_table[offset + j].x = ax;
+    aff_table[offset + j].y = ay;
 }
 ")
 
