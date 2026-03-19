@@ -1,4 +1,4 @@
-name: GPU Extension Build
+name: GPU Build
 
 on:
   workflow_dispatch:
@@ -15,31 +15,26 @@ jobs:
             name: Windows amd64 (CUDA + OpenCL)
             gpu_flags: UFSECP_ENABLE_CUDA=ON UFSECP_ENABLE_OPENCL=ON
             install_cuda: true
-            shell: bash
 
           - runner: ubuntu-22.04
             name: Linux amd64 (CUDA + OpenCL)
             gpu_flags: UFSECP_ENABLE_CUDA=ON UFSECP_ENABLE_OPENCL=ON
             install_cuda: true
-            shell: bash
 
           - runner: ubuntu-22.04-arm
             name: Linux arm64 (CUDA + OpenCL)
             gpu_flags: UFSECP_ENABLE_CUDA=ON UFSECP_ENABLE_OPENCL=ON
             install_cuda: true
-            shell: bash
 
           - runner: macos-15-intel
             name: macOS amd64 (Metal)
             gpu_flags: UFSECP_ENABLE_METAL=ON
             install_cuda: false
-            shell: bash
 
           - runner: macos-15
             name: macOS arm64 (Metal)
             gpu_flags: UFSECP_ENABLE_METAL=ON
             install_cuda: false
-            shell: bash
 
     steps:
       - uses: actions/checkout@v4
@@ -55,7 +50,7 @@ jobs:
           method: 'network'
 
       - name: Install Ninja
-        shell: ${{ matrix.shell }}
+        shell: bash
         run: |
           if command -v ninja &>/dev/null; then
             echo "Ninja already installed"
@@ -69,12 +64,12 @@ jobs:
 
       - name: Install OpenSSL (Windows)
         if: ${{ startsWith(matrix.runner, 'windows') }}
-        shell: ${{ matrix.shell }}
+        shell: bash
         run: |
           choco install openssl
 
       - name: Build extension
-        shell: ${{ matrix.shell }}
+        shell: bash
         run: |
           ${{ matrix.gpu_flags }} GEN=ninja make release
 
