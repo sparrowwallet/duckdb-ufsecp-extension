@@ -1,5 +1,9 @@
 cmake_minimum_required(VERSION 3.18)
 
+if(APPLE)
+    set(CMAKE_OSX_DEPLOYMENT_TARGET 13.0 CACHE STRING "Minimum macOS deployment version" FORCE)
+endif()
+
 set(TARGET_NAME ufsecp)
 
 find_package(OpenSSL REQUIRED)
