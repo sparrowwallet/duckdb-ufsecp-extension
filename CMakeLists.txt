@@ -71,6 +71,14 @@ set(SECP256K1_BUILD_METAL OFF CACHE BOOL "" FORCE)
 set(SECP256K1_BUILD_ROCM OFF CACHE BOOL "" FORCE)
 set(SECP256K1_INSTALL OFF CACHE BOOL "" FORCE)
 
+# Default to portable x86-64-v3 (AVX2/FMA/BMI2) on x86_64 unless overridden.
+# Override with -DSECP256K1_MARCH=native for local benchmarking.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|X64")
+    if(NOT DEFINED SECP256K1_MARCH OR SECP256K1_MARCH STREQUAL "")
+        set(SECP256K1_MARCH "x86-64-v3" CACHE STRING "" FORCE)
+    endif()
+endif()
+
 # We do NOT build secp256k1_cuda_lib — all CUDA device functions are
 # header-only (__device__ inline) in the .cuh headers. Our ufsecp_gpu.cu
 # includes them directly, matching the cudasp/gECC header-only pattern.
