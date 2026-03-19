@@ -13,27 +13,22 @@ jobs:
         include:
           - runner: windows-2022
             name: Windows amd64 (CUDA + OpenCL)
-            gpu_flags: UFSECP_ENABLE_CUDA=ON UFSECP_ENABLE_OPENCL=ON
             install_cuda: true
 
           - runner: ubuntu-22.04
             name: Linux amd64 (CUDA + OpenCL)
-            gpu_flags: UFSECP_ENABLE_CUDA=ON UFSECP_ENABLE_OPENCL=ON
             install_cuda: true
 
           - runner: ubuntu-22.04-arm
             name: Linux arm64 (CUDA + OpenCL)
-            gpu_flags: UFSECP_ENABLE_CUDA=ON UFSECP_ENABLE_OPENCL=ON
             install_cuda: true
 
           - runner: macos-15-intel
             name: macOS amd64 (Metal)
-            gpu_flags: UFSECP_ENABLE_METAL=ON
             install_cuda: false
 
           - runner: macos-15
             name: macOS arm64 (Metal)
-            gpu_flags: UFSECP_ENABLE_METAL=ON
             install_cuda: false
 
     steps:
@@ -62,24 +57,26 @@ jobs:
             choco install ninja
           fi
 
-      - name: Setup MSVC (Windows)
+      - name: Setup vcpkg
         if: ${{ startsWith(matrix.runner, 'windows') }}
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: lukka/run-vcpkg@v11.1
+        with:
+          vcpkgGitCommitId: 'ce613c41372b23b1f51333815feb3edd87ef8a8b'
 
-      - name: Install OpenSSL via vcpkg (Windows)
+      - name: Build extension (Windows)
         if: ${{ startsWith(matrix.runner, 'windows') }}
-        shell: bash
+        shell: cmd
         run: |
-          git clone --depth 1 https://github.com/microsoft/vcpkg.git vcpkg_install
-          ./vcpkg_install/bootstrap-vcpkg.sh
-          ./vcpkg_install/vcpkg install openssl:x64-windows-static
-          echo "OPENSSL_ROOT_DIR=$PWD/vcpkg_install/installed/x64-windows-static" >> $GITHUB_ENV
-          echo "OPENSSL_USE_STATIC_LIBS=TRUE" >> $GITHUB_ENV
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          mv "C:\Program Files\Git\usr\bin\link.exe" "C:\Program Files\Git\usr\bin\link-git.exe"
+          set GEN=ninja
+          make release
 
       - name: Build extension
+        if: ${{ !startsWith(matrix.runner, 'windows') }}
         shell: bash
         run: |
-          ${{ matrix.gpu_flags }} GEN=ninja make release
+          GEN=ninja make release
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
