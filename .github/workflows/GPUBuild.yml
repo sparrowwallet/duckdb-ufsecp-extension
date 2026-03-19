@@ -1,0 +1,87 @@
+name: GPU Extension Build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  gpu-build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2022
+            name: Windows amd64 (CUDA + OpenCL)
+            gpu_flags: UFSECP_ENABLE_CUDA=ON UFSECP_ENABLE_OPENCL=ON
+            install_cuda: true
+            shell: bash
+
+          - runner: ubuntu-22.04
+            name: Linux amd64 (CUDA + OpenCL)
+            gpu_flags: UFSECP_ENABLE_CUDA=ON UFSECP_ENABLE_OPENCL=ON
+            install_cuda: true
+            shell: bash
+
+          - runner: ubuntu-22.04-arm
+            name: Linux arm64 (CUDA + OpenCL)
+            gpu_flags: UFSECP_ENABLE_CUDA=ON UFSECP_ENABLE_OPENCL=ON
+            install_cuda: true
+            shell: bash
+
+          - runner: macos-15-intel
+            name: macOS amd64 (Metal)
+            gpu_flags: UFSECP_ENABLE_METAL=ON
+            install_cuda: false
+            shell: bash
+
+          - runner: macos-15
+            name: macOS arm64 (Metal)
+            gpu_flags: UFSECP_ENABLE_METAL=ON
+            install_cuda: false
+            shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: 'recursive'
+
+      - name: Install CUDA Toolkit
+        if: ${{ matrix.install_cuda }}
+        uses: Jimver/cuda-toolkit@v0.2.30
+        with:
+          cuda: '13.1.0'
+          method: 'network'
+
+      - name: Install Ninja
+        shell: ${{ matrix.shell }}
+        run: |
+          if command -v ninja &>/dev/null; then
+            echo "Ninja already installed"
+          elif command -v apt-get &>/dev/null; then
+            sudo apt-get update && sudo apt-get install -y ninja-build
+          elif command -v brew &>/dev/null; then
+            brew install ninja
+          elif command -v choco &>/dev/null; then
+            choco install ninja
+          fi
+
+      - name: Install OpenSSL (Windows)
+        if: ${{ startsWith(matrix.runner, 'windows') }}
+        shell: ${{ matrix.shell }}
+        run: |
+          choco install openssl
+
+      - name: Build extension
+        shell: ${{ matrix.shell }}
+        run: |
+          ${{ matrix.gpu_flags }} GEN=ninja make release
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ufsecp-gpu-${{ matrix.runner }}
+          path: |
+            build/release/extension/ufsecp/ufsecp.duckdb_extension
+          if-no-files-found: warn

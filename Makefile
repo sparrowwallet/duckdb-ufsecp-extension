@@ -11,6 +11,13 @@ endif
 ifdef UFSECP_ENABLE_OPENCL
 EXT_FLAGS += -DUFSECP_ENABLE_OPENCL=$(UFSECP_ENABLE_OPENCL)
 endif
+
+# Auto-enable Metal on macOS (both arm64 and amd64) unless explicitly set.
+ifndef UFSECP_ENABLE_METAL
+ifeq ($(shell uname -s),Darwin)
+UFSECP_ENABLE_METAL := ON
+endif
+endif
 ifdef UFSECP_ENABLE_METAL
 EXT_FLAGS += -DUFSECP_ENABLE_METAL=$(UFSECP_ENABLE_METAL)
 endif
