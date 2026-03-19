@@ -44,6 +44,12 @@ jobs:
           cuda: '13.1.0'
           method: 'network'
 
+      - name: Install OpenCL development files (Linux)
+        if: ${{ matrix.install_cuda && !startsWith(matrix.runner, 'windows') }}
+        shell: bash
+        run: |
+          sudo apt-get update && sudo apt-get install -y ocl-icd-opencl-dev
+
       - name: Install Ninja
         shell: bash
         run: |
