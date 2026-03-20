@@ -8,14 +8,13 @@
 //   Phase 1: shared_secret = tweak_key × scan_key    (predecomp GLV from __constant__)
 //   Phase 2: serialized = SEC1_compressed(shared_secret) || 0x00000000
 //   Phase 3: hash = tagged_SHA256("BIP0352/SharedSecret", serialized)
-//   Phase 4: output_point = hash × G                 (scalar_mul_generator_lut)
+//   Phase 4: output_point = hash × G                 (generator LUT)
 //
 // Phase 1 reads precomputed wNAF digits from __constant__ memory (uploaded once
 // per batch), eliminating per-thread GLV decomposition + wNAF encoding.
 //
-// Phase 4 uses a precomputed 64 MB generator LUT (16 windows × 65536 entries)
-// for 15 mixed additions with zero doublings. Falls back to scalar_mul_generator_const
-// if LUT allocation fails.
+// Phase 4 uses a precomputed generator LUT for table-lookup multiplication.
+// Falls back to scalar_mul_generator_const if LUT allocation fails.
 //
 // Phases 5-6 (batch affine add + match) run on CPU.
 // ============================================================================
@@ -45,8 +44,6 @@ __device__ __constant__ static uint32_t BIP352_MIDSTATE[8] = {
 // ============================================================================
 // Predecomposed scan key in __constant__ memory
 // ============================================================================
-// wNAF digits + GLV flags precomputed on the CPU and uploaded once per batch.
-// Eliminates per-thread GLV decomposition + wNAF encoding (~1040 bytes stack).
 
 struct BIP352ScanKeyWnaf {
     int8_t wnaf1[130];
@@ -57,9 +54,8 @@ struct BIP352ScanKeyWnaf {
 
 __constant__ static BIP352ScanKeyWnaf g_scan_wnaf;
 
-// Predecomposed scalar multiply: scan_key × tweak_point
-// Reads wNAF digits from __constant__ memory, builds per-thread affine tables
-// from the tweak point (which varies per thread).
+static constexpr int WNAF_TABLE_SIZE = 8;
+
 __device__ inline void scalar_mul_predecomp(
     const JacobianPoint* p, JacobianPoint* r)
 {
@@ -71,13 +67,12 @@ __device__ inline void scalar_mul_predecomp(
         field_negate(&base.y, &base.y);
     }
 
-    constexpr int TABLE_SIZE = 8;  // w=5 -> 2^(5-2) = 8 odd multiples
-    AffinePoint tbl_P[TABLE_SIZE];
+    AffinePoint tbl_P[WNAF_TABLE_SIZE];
     FieldElement globalz;
-    build_wnaf_table_zr(&base, tbl_P, TABLE_SIZE, &globalz);
+    build_wnaf_table_zr(&base, tbl_P, WNAF_TABLE_SIZE, &globalz);
 
-    AffinePoint tbl_phiP[TABLE_SIZE];
-    derive_endo_table(tbl_P, tbl_phiP, TABLE_SIZE, g_scan_wnaf.flip_phi != 0);
+    AffinePoint tbl_phiP[WNAF_TABLE_SIZE];
+    derive_endo_table(tbl_P, tbl_phiP, WNAF_TABLE_SIZE, g_scan_wnaf.flip_phi != 0);
 
     r->infinity = true;
     field_set_zero(&r->x);
@@ -127,14 +122,56 @@ __device__ inline void scalar_mul_predecomp(
 // ============================================================================
 // Generator LUT — precomputed table for k*G (built once, persistent)
 // ============================================================================
+// LUT_WBITS controls the window width. Smaller windows = smaller table (better
+// cache behavior) but more additions. Default w=12 (5 MB, 21 additions) is the
+// sweet spot on RTX 5080 — fits in L2 cache and beats w=16 (64 MB, 15 additions).
 
-static constexpr int GEN_LUT_N = 65536;
-static constexpr int GEN_LUT_SLICES = 16;
+#ifndef LUT_WBITS
+#define LUT_WBITS 12
+#endif
+
+static constexpr int GEN_LUT_N = (1 << LUT_WBITS);
+static constexpr int GEN_LUT_SLICES = (256 + LUT_WBITS - 1) / LUT_WBITS;
 static constexpr int GEN_LUT_TOTAL = GEN_LUT_SLICES * GEN_LUT_N;
 
 static AffinePoint* g_gen_lut = nullptr;
 static bool g_lut_built = false;
 static std::mutex g_lut_mutex;
+
+// Configurable-width generator LUT lookup.
+__device__ inline void scalar_mul_gen_lut(
+    const Scalar* k, const AffinePoint* __restrict__ lut, JacobianPoint* r)
+{
+    r->infinity = true;
+    field_set_zero(&r->x);
+    field_set_one(&r->y);
+    field_set_zero(&r->z);
+
+    constexpr uint32_t MASK = (1u << LUT_WBITS) - 1;
+
+    #pragma unroll 1
+    for (int win = 0; win < GEN_LUT_SLICES; win++) {
+        int bitpos = win * LUT_WBITS;
+        int limb = bitpos >> 6;
+        int shift = bitpos & 63;
+
+        uint32_t idx = (uint32_t)((k->limbs[limb] >> shift) & MASK);
+        if (shift + LUT_WBITS > 64 && limb < 3)
+            idx |= (uint32_t)((k->limbs[limb + 1] << (64 - shift)) & MASK);
+
+        if (idx != 0) {
+            const AffinePoint* pt = &lut[(uint32_t)win * GEN_LUT_N + idx];
+            if (r->infinity) {
+                r->x = pt->x;
+                r->y = pt->y;
+                field_set_one(&r->z);
+                r->infinity = false;
+            } else {
+                jacobian_add_mixed(r, pt, r);
+            }
+        }
+    }
+}
 
 // ============================================================================
 // LUT build kernels
@@ -150,7 +187,7 @@ __global__ void ComputeLutBasePoints(AffinePoint* bases) {
     p.infinity = false;
 
     for (int i = 1; i < GEN_LUT_SLICES; i++) {
-        for (int d = 0; d < 16; d++)
+        for (int d = 0; d < LUT_WBITS; d++)
             jacobian_double(&p, &p);
 
         FieldElement z_inv, z_inv2, z_inv3;
@@ -293,18 +330,19 @@ static void EnsureGenLutBuilt(int device_id) {
 // ============================================================================
 
 struct UfsecpGpuBatchState {
-    uint8_t* d_tweak_xy;     // Device: N × 64 bytes (32B x LE || 32B y LE)
-    uint8_t* d_output_x;     // Device: N × 32 bytes (affine x, LE)
-    uint8_t* d_output_y;     // Device: N × 32 bytes (affine y, LE)
+    uint8_t* d_tweak_xy;
+    uint8_t* d_output_x;
+    uint8_t* d_output_y;
     uint32_t count;
     cudaStream_t stream;
     int device_id;
 };
 
 // ============================================================================
-// Fused BIP-352 kernel with LUT + predecomp scan key
+// Fused BIP-352 kernels
 // ============================================================================
 
+// Predecomp scan key + generator LUT
 __global__ void BIP352FusedKernelLUT(
     const uint8_t* __restrict__ tweak_xy,
     uint8_t* __restrict__ out_x,
@@ -316,7 +354,6 @@ __global__ void BIP352FusedKernelLUT(
     if (idx >= count) return;
 
     const uint8_t* tweak = tweak_xy + idx * 64;
-
     FieldElement fx, fy;
     for (int i = 0; i < 4; i++) {
         uint64_t lx = 0, ly = 0;
@@ -334,11 +371,9 @@ __global__ void BIP352FusedKernelLUT(
     field_set_one(&tweak_point.z);
     tweak_point.infinity = false;
 
-    // Phase 1: shared_secret (predecomp GLV from __constant__)
     JacobianPoint shared_point;
     scalar_mul_predecomp(&tweak_point, &shared_point);
 
-    // Phase 2: Jacobian → affine → SEC1 compressed serialization
     FieldElement z_inv, z_inv2, z_inv3, x_aff, y_aff;
     field_inv(&shared_point.z, &z_inv);
     field_sqr(&z_inv, &z_inv2);
@@ -357,7 +392,6 @@ __global__ void BIP352FusedKernelLUT(
     serialized[33] = 0; serialized[34] = 0;
     serialized[35] = 0; serialized[36] = 0;
 
-    // Phase 3: Tagged hash
     SHA256Ctx ctx;
     for (int i = 0; i < 8; i++)
         ctx.h[i] = BIP352_MIDSTATE[i];
@@ -367,11 +401,10 @@ __global__ void BIP352FusedKernelLUT(
     uint8_t hash[32];
     sha256_final(&ctx, hash);
 
-    // Phase 4: Generator multiplication via LUT
     Scalar hash_scalar;
     scalar_from_bytes(hash, &hash_scalar);
     JacobianPoint output_point;
-    scalar_mul_generator_lut(&hash_scalar, gen_lut, &output_point);
+    scalar_mul_gen_lut(&hash_scalar, gen_lut, &output_point);
 
     jacobian_to_affine(&output_point.x, &output_point.y, &output_point.z);
 
@@ -387,10 +420,7 @@ __global__ void BIP352FusedKernelLUT(
     }
 }
 
-// ============================================================================
 // Fallback: predecomp scan key + w=4 generator mul (no LUT)
-// ============================================================================
-
 __global__ void BIP352FusedKernel(
     const uint8_t* __restrict__ tweak_xy,
     uint8_t* __restrict__ out_x,
@@ -401,7 +431,6 @@ __global__ void BIP352FusedKernel(
     if (idx >= count) return;
 
     const uint8_t* tweak = tweak_xy + idx * 64;
-
     FieldElement fx, fy;
     for (int i = 0; i < 4; i++) {
         uint64_t lx = 0, ly = 0;
@@ -484,19 +513,15 @@ int UfsecpCudaDetect(int* num_gpus) {
 }
 
 void* UfsecpCudaLaunchBatch(
-    const uint8_t* scan_key,       // 32 bytes (LE, same for all rows)
-    const uint8_t* tweak_data,     // N × 64 bytes
+    const uint8_t* scan_key,
+    const uint8_t* tweak_data,
     uint32_t count,
     int device_id,
-    const void* precomp)           // BIP352ScanKeyGlv (264 bytes, precomputed on CPU)
+    const void* precomp)
 {
     cudaError_t err = cudaSetDevice(device_id);
     if (err != cudaSuccess) return nullptr;
 
-    // Upload precomputed scan key wNAF to __constant__ memory
-    // BIP352ScanKeyGlv layout: char[130] + char[130] + u8 + u8 + 2 pad = 264 bytes
-    // BIP352ScanKeyWnaf layout: int8_t[130] + int8_t[130] + u8 + u8 = 262 bytes
-    // The first 262 bytes are layout-compatible (char == int8_t on all platforms).
     if (precomp) {
         cudaMemcpyToSymbol(g_scan_wnaf, precomp, sizeof(BIP352ScanKeyWnaf));
     }

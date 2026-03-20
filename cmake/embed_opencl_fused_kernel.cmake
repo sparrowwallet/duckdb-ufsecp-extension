@@ -39,6 +39,36 @@ endforeach()
 
 set(EXT_KERNELS "
 // =============================================================================
+// Generator LUT lookup (w=12: 22 slices x 4096 entries = 5 MB)
+// =============================================================================
+
+#define LUT_WBITS       12
+#define GEN_LUT_N       (1 << LUT_WBITS)
+#define GEN_LUT_SLICES  ((256 + LUT_WBITS - 1) / LUT_WBITS)
+
+inline void scalar_mul_gen_lut(JacobianPoint* r, const Scalar* k,
+                               __global const AffinePoint* lut) {
+    point_set_infinity(r);
+    uint mask = (1u << LUT_WBITS) - 1;
+    for (int win = 0; win < GEN_LUT_SLICES; win++) {
+        int bitpos = win * LUT_WBITS;
+        int limb = bitpos >> 6;
+        int shift = bitpos & 63;
+        uint idx = (uint)((k->limbs[limb] >> shift) & mask);
+        if (shift + LUT_WBITS > 64 && limb < 3)
+            idx |= (uint)((k->limbs[limb + 1] << (64 - shift)) & mask);
+        if (idx != 0) {
+            AffinePoint pt = lut[(uint)win * GEN_LUT_N + idx];
+            if (point_is_infinity(r)) {
+                point_from_affine(r, &pt);
+            } else {
+                point_add_mixed_impl(r, r, &pt);
+            }
+        }
+    }
+}
+
+// =============================================================================
 // Fused BIP-352 kernel -- predecomp scan key + GLV generator multiplication
 // =============================================================================
 
@@ -142,11 +172,11 @@ __kernel void bip352_fused_kernel_lut(
     uchar hash[32];
     bip352_tagged_sha256_impl(ser, 37, hash);
 
-    // Phase 4: k*G via LUT (15 additions, 0 doublings)
+    // Phase 4: k*G via LUT (w=12, 21 additions, 0 doublings)
     Scalar hs;
     scalar_from_bytes_impl(hash, &hs);
     JacobianPoint out_jac;
-    scalar_mul_generator_lut_impl(&out_jac, &hs, gen_lut);
+    scalar_mul_gen_lut(&out_jac, &hs, gen_lut);
 
     AffinePoint out_aff;
     jacobian_to_affine_convert_impl(&out_aff,
@@ -165,11 +195,8 @@ __kernel void bip352_fused_kernel_lut(
 }
 
 // =============================================================================
-// Generator LUT build kernels (16 x 65536 = 64 MB precomputed table)
+// Generator LUT build kernels
 // =============================================================================
-
-#define GEN_LUT_SLICES  16
-#define GEN_LUT_N       65536
 
 __kernel void compute_lut_base_points(__global AffinePoint* bases) {
     AffinePoint g_local = GENERATOR_TABLE_W8[1];
@@ -179,7 +206,7 @@ __kernel void compute_lut_base_points(__global AffinePoint* bases) {
     point_from_affine(&p, &g_local);
 
     for (int i = 1; i < GEN_LUT_SLICES; i++) {
-        for (int d = 0; d < 16; d++)
+        for (int d = 0; d < LUT_WBITS; d++)
             point_double_impl(&p, &p);
 
         FieldElement z_inv, z_inv2, z_inv3, ax, ay;
