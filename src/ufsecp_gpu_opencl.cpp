@@ -55,9 +55,11 @@ static cl_mem g_ocl_spend_buf = nullptr;
 // ============================================================================
 
 static void EnsureOclGenLutBuilt() {
-	if (g_ocl_lut_built) return;
+	if (g_ocl_lut_built)
+		return;
 	std::lock_guard<std::mutex> lock(g_ocl_lut_mutex);
-	if (g_ocl_lut_built) return;
+	if (g_ocl_lut_built)
+		return;
 
 	auto *ctx = static_cast<cl_context>(g_ocl_ctx->native_context());
 	auto *queue = static_cast<cl_command_queue>(g_ocl_ctx->native_queue());
@@ -71,13 +73,25 @@ static void EnsureOclGenLutBuilt() {
 	static constexpr size_t FIELD_SIZE = 32;
 
 	cl_mem d_bases = clCreateBuffer(ctx, CL_MEM_READ_WRITE, SLICES * AFFINE_SIZE, nullptr, &err);
-	if (err != CL_SUCCESS) { g_ocl_lut_built = true; return; }
+	if (err != CL_SUCCESS) {
+		g_ocl_lut_built = true;
+		return;
+	}
 
 	cl_mem d_lut = clCreateBuffer(ctx, CL_MEM_READ_WRITE, (size_t)TOTAL * AFFINE_SIZE, nullptr, &err);
-	if (err != CL_SUCCESS) { clReleaseMemObject(d_bases); g_ocl_lut_built = true; return; }
+	if (err != CL_SUCCESS) {
+		clReleaseMemObject(d_bases);
+		g_ocl_lut_built = true;
+		return;
+	}
 
 	cl_mem d_h_buf = clCreateBuffer(ctx, CL_MEM_READ_WRITE, (size_t)TOTAL * FIELD_SIZE, nullptr, &err);
-	if (err != CL_SUCCESS) { clReleaseMemObject(d_bases); clReleaseMemObject(d_lut); g_ocl_lut_built = true; return; }
+	if (err != CL_SUCCESS) {
+		clReleaseMemObject(d_bases);
+		clReleaseMemObject(d_lut);
+		g_ocl_lut_built = true;
+		return;
+	}
 
 	{
 		std::lock_guard<std::mutex> lock(g_ocl_mutex);
@@ -148,7 +162,8 @@ static ocl::Scalar scalar_from_le(const uint8_t *le32) {
 	ocl::Scalar s;
 	for (int i = 0; i < 4; i++) {
 		uint64_t v = 0;
-		for (int j = 0; j < 8; j++) v |= (uint64_t)le32[i * 8 + j] << (j * 8);
+		for (int j = 0; j < 8; j++)
+			v |= (uint64_t)le32[i * 8 + j] << (j * 8);
 		s.limbs[i] = v;
 	}
 	return s;
@@ -158,7 +173,8 @@ static ocl::Scalar scalar_from_be(const uint8_t *be32) {
 	ocl::Scalar s;
 	for (int i = 0; i < 4; i++) {
 		uint64_t v = 0;
-		for (int j = 0; j < 8; j++) v |= (uint64_t)be32[31 - (i * 8 + j)] << (j * 8);
+		for (int j = 0; j < 8; j++)
+			v |= (uint64_t)be32[31 - (i * 8 + j)] << (j * 8);
 		s.limbs[i] = v;
 	}
 	return s;
@@ -181,7 +197,8 @@ static ocl::AffinePoint affine_from_le(const uint8_t *xy64) {
 static void affine_to_compressed(const ocl::AffinePoint &ap, uint8_t *out33) {
 	for (int i = 0; i < 4; i++) {
 		uint64_t v = ap.x.limbs[i];
-		for (int j = 0; j < 8; j++) out33[32 - (i * 8 + j)] = (uint8_t)(v >> (j * 8));
+		for (int j = 0; j < 8; j++)
+			out33[32 - (i * 8 + j)] = (uint8_t)(v >> (j * 8));
 	}
 	out33[0] = (ap.y.limbs[0] & 1) ? 0x03 : 0x02;
 }
@@ -236,34 +253,44 @@ int UfsecpOclDetect(int *num_gpus) {
 							cl_int lut_err;
 							g_lut_base_kernel = clCreateKernel(g_fused_program, "compute_lut_base_points", &lut_err);
 							if (lut_err == CL_SUCCESS)
-								g_lut_build_kernel = clCreateKernel(g_fused_program, "gen_lut_build_affine_kernel", &lut_err);
+								g_lut_build_kernel =
+								    clCreateKernel(g_fused_program, "gen_lut_build_affine_kernel", &lut_err);
 							if (lut_err == CL_SUCCESS)
-								g_lut_convert_kernel = clCreateKernel(g_fused_program, "gen_lut_convert_zinv_kernel", &lut_err);
+								g_lut_convert_kernel =
+								    clCreateKernel(g_fused_program, "gen_lut_convert_zinv_kernel", &lut_err);
 							if (lut_err == CL_SUCCESS)
-								g_fused_kernel_lut = clCreateKernel(g_fused_program, "bip352_fused_kernel_lut", &lut_err);
+								g_fused_kernel_lut =
+								    clCreateKernel(g_fused_program, "bip352_fused_kernel_lut", &lut_err);
 							g_use_lut = (lut_err == CL_SUCCESS);
-							if (g_use_lut) fprintf(stderr, "[OpenCL] LUT kernels available\n");
+							if (g_use_lut)
+								fprintf(stderr, "[OpenCL] LUT kernels available\n");
 
 							// Full pipeline kernels
 							cl_int fp_err;
 							g_full_pass1_kernel = clCreateKernel(g_fused_program, "bip352_full_pass1", &fp_err);
 							if (fp_err == CL_SUCCESS)
-								g_batch_inv_match_kernel = clCreateKernel(g_fused_program, "bip352_batch_inv_match", &fp_err);
+								g_batch_inv_match_kernel =
+								    clCreateKernel(g_fused_program, "bip352_batch_inv_match", &fp_err);
 							g_use_full = (fp_err == CL_SUCCESS && g_use_lut);
-							if (g_use_full) fprintf(stderr, "[OpenCL] Full pipeline kernels available\n");
+							if (g_use_full)
+								fprintf(stderr, "[OpenCL] Full pipeline kernels available\n");
 						} else {
 							size_t log_size = 0;
 							clGetProgramBuildInfo(g_fused_program, device, CL_PROGRAM_BUILD_LOG, 0, nullptr, &log_size);
 							if (log_size > 1) {
 								std::vector<char> log(log_size);
-								clGetProgramBuildInfo(g_fused_program, device, CL_PROGRAM_BUILD_LOG, log_size, log.data(), nullptr);
+								clGetProgramBuildInfo(g_fused_program, device, CL_PROGRAM_BUILD_LOG, log_size,
+								                      log.data(), nullptr);
 								fprintf(stderr, "[OpenCL] Fused kernel build failed:\n%s\n", log.data());
 							}
 						}
 					}
 					if (!g_use_fused) {
 						fprintf(stderr, "[OpenCL] Fused kernel unavailable, using multi-dispatch fallback\n");
-						if (g_fused_program) { clReleaseProgram(g_fused_program); g_fused_program = nullptr; }
+						if (g_fused_program) {
+							clReleaseProgram(g_fused_program);
+							g_fused_program = nullptr;
+						}
 					}
 				}
 			}
@@ -275,10 +302,10 @@ int UfsecpOclDetect(int *num_gpus) {
 }
 
 // Upload spend key + labels (once per query)
-void UfsecpOclSetSpendKey(const uint8_t *spend_xy, int num_labels,
-                          const uint8_t *label_keys_xy, int device_id) {
+void UfsecpOclSetSpendKey(const uint8_t *spend_xy, int num_labels, const uint8_t *label_keys_xy, int device_id) {
 	(void)device_id;
-	if (!g_ocl_ctx) return;
+	if (!g_ocl_ctx)
+		return;
 
 	auto *ctx = static_cast<cl_context>(g_ocl_ctx->native_context());
 
@@ -294,19 +321,21 @@ void UfsecpOclSetSpendKey(const uint8_t *spend_xy, int num_labels,
 	if (label_keys_xy && n > 0)
 		std::memcpy(spend_data + 64, label_keys_xy, n * 64);
 
-	spend_data[64 + 16 * 64] = (uint8_t)n;  // num_labels
+	spend_data[64 + 16 * 64] = (uint8_t)n; // num_labels
 
-	if (g_ocl_spend_buf) clReleaseMemObject(g_ocl_spend_buf);
+	if (g_ocl_spend_buf)
+		clReleaseMemObject(g_ocl_spend_buf);
 	cl_int err;
 	g_ocl_spend_buf = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, SPEND_SIZE, spend_data, &err);
 }
 
 // Full pipeline launch
 void *UfsecpOclLaunchBatchFull(const uint8_t *tweak_data, const int64_t *output_prefixes, uint32_t total_outputs,
-                               const uint32_t *output_offsets, const uint8_t *output_lengths,
-                               uint32_t count, int device_id, const void *precomp) {
+                               const uint32_t *output_offsets, const uint8_t *output_lengths, uint32_t count,
+                               int device_id, const void *precomp) {
 	(void)device_id;
-	if (!g_ocl_ctx || !g_ocl_ctx->is_valid() || !g_use_full) return nullptr;
+	if (!g_ocl_ctx || !g_ocl_ctx->is_valid() || !g_use_full)
+		return nullptr;
 
 	auto *ctx_cl = static_cast<cl_context>(g_ocl_ctx->native_context());
 	cl_int err;
@@ -320,68 +349,91 @@ void *UfsecpOclLaunchBatchFull(const uint8_t *tweak_data, const int64_t *output_
 
 	state->tweak_buf = clCreateBuffer(ctx_cl, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, count * 64,
 	                                  const_cast<uint8_t *>(tweak_data), &err);
-	if (err != CL_SUCCESS) { delete state; return nullptr; }
+	if (err != CL_SUCCESS) {
+		delete state;
+		return nullptr;
+	}
 
-	state->scan_plan_buf = clCreateBuffer(ctx_cl, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, 264,
-	                                     const_cast<void *>(precomp), &err);
-	if (err != CL_SUCCESS) goto fail;
+	state->scan_plan_buf =
+	    clCreateBuffer(ctx_cl, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, 264, const_cast<void *>(precomp), &err);
+	if (err != CL_SUCCESS)
+		goto fail;
 
-	state->output_prefixes_buf = clCreateBuffer(ctx_cl, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-	                                            (size_t)total_outputs * sizeof(int64_t),
-	                                            const_cast<int64_t *>(output_prefixes), &err);
-	if (err != CL_SUCCESS) goto fail;
+	state->output_prefixes_buf =
+	    clCreateBuffer(ctx_cl, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, (size_t)total_outputs * sizeof(int64_t),
+	                   const_cast<int64_t *>(output_prefixes), &err);
+	if (err != CL_SUCCESS)
+		goto fail;
 
-	state->output_offsets_buf = clCreateBuffer(ctx_cl, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-	                                           (size_t)count * sizeof(uint32_t),
-	                                           const_cast<uint32_t *>(output_offsets), &err);
-	if (err != CL_SUCCESS) goto fail;
+	state->output_offsets_buf =
+	    clCreateBuffer(ctx_cl, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, (size_t)count * sizeof(uint32_t),
+	                   const_cast<uint32_t *>(output_offsets), &err);
+	if (err != CL_SUCCESS)
+		goto fail;
 
-	state->output_lengths_buf = clCreateBuffer(ctx_cl, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-	                                            (size_t)count, const_cast<uint8_t *>(output_lengths), &err);
-	if (err != CL_SUCCESS) goto fail;
+	state->output_lengths_buf = clCreateBuffer(ctx_cl, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, (size_t)count,
+	                                           const_cast<uint8_t *>(output_lengths), &err);
+	if (err != CL_SUCCESS)
+		goto fail;
 
 	state->match_flags_buf = clCreateBuffer(ctx_cl, CL_MEM_WRITE_ONLY, (size_t)count, nullptr, &err);
-	if (err != CL_SUCCESS) goto fail;
+	if (err != CL_SUCCESS)
+		goto fail;
 
 	// FieldElement = 32 bytes, JacobianPoint = 4*32 + 4 padding... check OpenCL struct size
 	// In OpenCL: JacobianPoint = {FieldElement x, y, z; uint infinity; } = 3*32 + 4 = 100, but
 	// the library may pad differently. Use sizeof from the host types.
 	state->cand_x_buf = clCreateBuffer(ctx_cl, CL_MEM_READ_WRITE, (size_t)count * 32, nullptr, &err);
-	if (err != CL_SUCCESS) goto fail;
+	if (err != CL_SUCCESS)
+		goto fail;
 
 	state->cand_z_buf = clCreateBuffer(ctx_cl, CL_MEM_READ_WRITE, (size_t)count * 32, nullptr, &err);
-	if (err != CL_SUCCESS) goto fail;
+	if (err != CL_SUCCESS)
+		goto fail;
 
 	// JacobianPoint in OpenCL: {FieldElement x, y, z; uint infinity;} with padding
 	// FieldElement = 4 * ulong = 32 bytes. JacobianPoint = 3*32 + 4 = 100, but likely padded to 128
 	// Let's use 128 bytes to be safe (matches CUDA alignment)
 	state->output_pts_buf = clCreateBuffer(ctx_cl, CL_MEM_READ_WRITE, (size_t)count * 128, nullptr, &err);
-	if (err != CL_SUCCESS) goto fail;
+	if (err != CL_SUCCESS)
+		goto fail;
 
 	return state;
 
 fail:
-	if (state->tweak_buf) clReleaseMemObject(state->tweak_buf);
-	if (state->scan_plan_buf) clReleaseMemObject(state->scan_plan_buf);
-	if (state->output_prefixes_buf) clReleaseMemObject(state->output_prefixes_buf);
-	if (state->output_offsets_buf) clReleaseMemObject(state->output_offsets_buf);
-	if (state->output_lengths_buf) clReleaseMemObject(state->output_lengths_buf);
-	if (state->match_flags_buf) clReleaseMemObject(state->match_flags_buf);
-	if (state->cand_x_buf) clReleaseMemObject(state->cand_x_buf);
-	if (state->cand_z_buf) clReleaseMemObject(state->cand_z_buf);
-	if (state->output_pts_buf) clReleaseMemObject(state->output_pts_buf);
+	if (state->tweak_buf)
+		clReleaseMemObject(state->tweak_buf);
+	if (state->scan_plan_buf)
+		clReleaseMemObject(state->scan_plan_buf);
+	if (state->output_prefixes_buf)
+		clReleaseMemObject(state->output_prefixes_buf);
+	if (state->output_offsets_buf)
+		clReleaseMemObject(state->output_offsets_buf);
+	if (state->output_lengths_buf)
+		clReleaseMemObject(state->output_lengths_buf);
+	if (state->match_flags_buf)
+		clReleaseMemObject(state->match_flags_buf);
+	if (state->cand_x_buf)
+		clReleaseMemObject(state->cand_x_buf);
+	if (state->cand_z_buf)
+		clReleaseMemObject(state->cand_z_buf);
+	if (state->output_pts_buf)
+		clReleaseMemObject(state->output_pts_buf);
 	delete state;
 	return nullptr;
 }
 
 int UfsecpOclRunKernelsFull(void *state_handle, uint8_t *match_flags, uint32_t count) {
 	auto *state = static_cast<UfsecpOclBatchState *>(state_handle);
-	if (!state || !g_ocl_ctx || !g_ocl_gen_lut || !g_ocl_spend_buf) return -1;
+	if (!state || !g_ocl_ctx || !g_ocl_gen_lut || !g_ocl_spend_buf)
+		return -1;
 
 	auto *queue = static_cast<cl_command_queue>(g_ocl_ctx->native_queue());
 
-	if (g_use_lut) EnsureOclGenLutBuilt();
-	if (!g_ocl_gen_lut) return -1;
+	if (g_use_lut)
+		EnsureOclGenLutBuilt();
+	if (!g_ocl_gen_lut)
+		return -1;
 
 	std::lock_guard<std::mutex> lock(g_ocl_mutex);
 
@@ -399,7 +451,8 @@ int UfsecpOclRunKernelsFull(void *state_handle, uint8_t *match_flags, uint32_t c
 
 		size_t local = 128, global = ((count + local - 1) / local) * local;
 		cl_int err = clEnqueueNDRangeKernel(queue, k, 1, nullptr, &global, &local, 0, nullptr, nullptr);
-		if (err != CL_SUCCESS) return -1;
+		if (err != CL_SUCCESS)
+			return -1;
 	}
 
 	// Pass 2: fused batch inversion + match
@@ -415,13 +468,14 @@ int UfsecpOclRunKernelsFull(void *state_handle, uint8_t *match_flags, uint32_t c
 		clSetKernelArg(k, 7, sizeof(cl_mem), &state->match_flags_buf);
 		// local memory: 2 * local_size * sizeof(FieldElement)
 		size_t local = 256;
-		size_t shared_size = 2 * local * 32;  // FieldElement = 32 bytes
+		size_t shared_size = 2 * local * 32; // FieldElement = 32 bytes
 		clSetKernelArg(k, 8, shared_size, nullptr);
 		clSetKernelArg(k, 9, sizeof(uint32_t), &count);
 
 		size_t global = ((count + local - 1) / local) * local;
 		cl_int err = clEnqueueNDRangeKernel(queue, k, 1, nullptr, &global, &local, 0, nullptr, nullptr);
-		if (err != CL_SUCCESS) return -1;
+		if (err != CL_SUCCESS)
+			return -1;
 	}
 
 	clEnqueueReadBuffer(queue, state->match_flags_buf, CL_TRUE, 0, count, match_flags, 0, nullptr, nullptr);
@@ -434,7 +488,8 @@ int UfsecpOclRunKernelsFull(void *state_handle, uint8_t *match_flags, uint32_t c
 void *UfsecpOclLaunchBatch(const uint8_t *scan_key, const uint8_t *tweak_data, uint32_t count, int device_id,
                            const void *precomp) {
 	(void)device_id;
-	if (!g_ocl_ctx || !g_ocl_ctx->is_valid()) return nullptr;
+	if (!g_ocl_ctx || !g_ocl_ctx->is_valid())
+		return nullptr;
 
 	auto *state = new UfsecpOclBatchState();
 	state->count = count;
@@ -454,22 +509,34 @@ void *UfsecpOclLaunchBatch(const uint8_t *scan_key, const uint8_t *tweak_data, u
 
 		state->tweak_buf = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, count * 64,
 		                                  const_cast<uint8_t *>(tweak_data), &err);
-		if (err != CL_SUCCESS) { delete state; return nullptr; }
+		if (err != CL_SUCCESS) {
+			delete state;
+			return nullptr;
+		}
 
-		state->scan_plan_buf = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, 264,
-		                                     const_cast<void *>(precomp), &err);
-		if (err != CL_SUCCESS) { clReleaseMemObject(state->tweak_buf); delete state; return nullptr; }
+		state->scan_plan_buf =
+		    clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, 264, const_cast<void *>(precomp), &err);
+		if (err != CL_SUCCESS) {
+			clReleaseMemObject(state->tweak_buf);
+			delete state;
+			return nullptr;
+		}
 
 		state->out_x_buf = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY, count * 32, nullptr, &err);
 		if (err != CL_SUCCESS) {
-			clReleaseMemObject(state->tweak_buf); clReleaseMemObject(state->scan_plan_buf);
-			delete state; return nullptr;
+			clReleaseMemObject(state->tweak_buf);
+			clReleaseMemObject(state->scan_plan_buf);
+			delete state;
+			return nullptr;
 		}
 
 		state->out_y_buf = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY, count * 32, nullptr, &err);
 		if (err != CL_SUCCESS) {
-			clReleaseMemObject(state->tweak_buf); clReleaseMemObject(state->scan_plan_buf);
-			clReleaseMemObject(state->out_x_buf); delete state; return nullptr;
+			clReleaseMemObject(state->tweak_buf);
+			clReleaseMemObject(state->scan_plan_buf);
+			clReleaseMemObject(state->out_x_buf);
+			delete state;
+			return nullptr;
 		}
 	} else {
 		ocl::Scalar scan_scalar = scalar_from_le(scan_key);
@@ -488,11 +555,13 @@ void *UfsecpOclLaunchBatch(const uint8_t *scan_key, const uint8_t *tweak_data, u
 
 int UfsecpOclRunKernels(void *state_handle, uint8_t *out_x, uint8_t *out_y, uint32_t count) {
 	auto *state = static_cast<UfsecpOclBatchState *>(state_handle);
-	if (!state || !g_ocl_ctx) return -1;
+	if (!state || !g_ocl_ctx)
+		return -1;
 
 	if (state->use_fused) {
 		auto *queue = static_cast<cl_command_queue>(g_ocl_ctx->native_queue());
-		if (g_use_lut) EnsureOclGenLutBuilt();
+		if (g_use_lut)
+			EnsureOclGenLutBuilt();
 
 		std::lock_guard<std::mutex> lock(g_ocl_mutex);
 
@@ -516,7 +585,8 @@ int UfsecpOclRunKernels(void *state_handle, uint8_t *out_x, uint8_t *out_y, uint
 
 		size_t local = 256, global = ((count + local - 1) / local) * local;
 		cl_int err = clEnqueueNDRangeKernel(queue, kernel, 1, nullptr, &global, &local, 0, nullptr, nullptr);
-		if (err != CL_SUCCESS) return -1;
+		if (err != CL_SUCCESS)
+			return -1;
 
 		clEnqueueReadBuffer(queue, state->out_x_buf, CL_TRUE, 0, count * 32, out_x, 0, nullptr, nullptr);
 		clEnqueueReadBuffer(queue, state->out_y_buf, CL_TRUE, 0, count * 32, out_y, 0, nullptr, nullptr);
@@ -558,19 +628,31 @@ int UfsecpOclRunKernels(void *state_handle, uint8_t *out_x, uint8_t *out_y, uint
 }
 
 void UfsecpOclFreeBatch(void *state_handle) {
-	if (!state_handle) return;
+	if (!state_handle)
+		return;
 	auto *state = static_cast<UfsecpOclBatchState *>(state_handle);
-	if (state->tweak_buf) clReleaseMemObject(state->tweak_buf);
-	if (state->scan_plan_buf) clReleaseMemObject(state->scan_plan_buf);
-	if (state->out_x_buf) clReleaseMemObject(state->out_x_buf);
-	if (state->out_y_buf) clReleaseMemObject(state->out_y_buf);
-	if (state->output_prefixes_buf) clReleaseMemObject(state->output_prefixes_buf);
-	if (state->output_offsets_buf) clReleaseMemObject(state->output_offsets_buf);
-	if (state->output_lengths_buf) clReleaseMemObject(state->output_lengths_buf);
-	if (state->match_flags_buf) clReleaseMemObject(state->match_flags_buf);
-	if (state->cand_x_buf) clReleaseMemObject(state->cand_x_buf);
-	if (state->cand_z_buf) clReleaseMemObject(state->cand_z_buf);
-	if (state->output_pts_buf) clReleaseMemObject(state->output_pts_buf);
+	if (state->tweak_buf)
+		clReleaseMemObject(state->tweak_buf);
+	if (state->scan_plan_buf)
+		clReleaseMemObject(state->scan_plan_buf);
+	if (state->out_x_buf)
+		clReleaseMemObject(state->out_x_buf);
+	if (state->out_y_buf)
+		clReleaseMemObject(state->out_y_buf);
+	if (state->output_prefixes_buf)
+		clReleaseMemObject(state->output_prefixes_buf);
+	if (state->output_offsets_buf)
+		clReleaseMemObject(state->output_offsets_buf);
+	if (state->output_lengths_buf)
+		clReleaseMemObject(state->output_lengths_buf);
+	if (state->match_flags_buf)
+		clReleaseMemObject(state->match_flags_buf);
+	if (state->cand_x_buf)
+		clReleaseMemObject(state->cand_x_buf);
+	if (state->cand_z_buf)
+		clReleaseMemObject(state->cand_z_buf);
+	if (state->output_pts_buf)
+		clReleaseMemObject(state->output_pts_buf);
 	delete state;
 }
 

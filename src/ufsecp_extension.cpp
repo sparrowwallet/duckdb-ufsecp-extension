@@ -292,7 +292,7 @@ struct UfsecpScanState : public GlobalTableFunctionState {
 	std::atomic<bool> output_thread_claimed;
 
 	// GPU spend key uploaded flag
-	std::atomic<bool> spend_key_uploaded{false};
+	std::atomic<bool> spend_key_uploaded {false};
 };
 
 // ============================================================================
@@ -570,8 +570,8 @@ static void ProcessBatchGpu(UfsecpScanLocalState &local_state, const UfsecpScanB
 			label_buf.insert(label_buf.end(), lk, lk + 64);
 		}
 
-		g_gpu_set_spend(sp, (int)bind_data.labelled_spend_keys.size(),
-		                label_buf.empty() ? nullptr : label_buf.data(), 0);
+		g_gpu_set_spend(sp, (int)bind_data.labelled_spend_keys.size(), label_buf.empty() ? nullptr : label_buf.data(),
+		                0);
 		global_state.spend_key_uploaded = true;
 	}
 
