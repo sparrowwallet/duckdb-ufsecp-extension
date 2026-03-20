@@ -105,6 +105,8 @@ else()
     set(SECP256K1_BUILD_METAL OFF CACHE BOOL "" FORCE)
 endif()
 
+set(UFSECP_REFRESH_SOURCE_GRAPH OFF CACHE BOOL "" FORCE)
+
 add_subdirectory(UltrafastSecp256k1)
 
 include_directories(src/include)
