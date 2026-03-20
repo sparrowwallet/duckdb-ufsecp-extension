@@ -180,6 +180,7 @@ if(UFSECP_ENABLE_OPENCL)
             ${OPENCL_KERNEL_DIR}/secp256k1_gen_table_w8.cl
             ${OPENCL_KERNEL_DIR}/secp256k1_extended.cl
             ${OPENCL_KERNEL_DIR}/secp256k1_affine.cl
+            ${OPENCL_KERNEL_DIR}/secp256k1_bip352.cl
             ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_opencl_fused_kernel.cmake
         COMMENT "Embedding OpenCL fused BIP-352 kernel source"
     )

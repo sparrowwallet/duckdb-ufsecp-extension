@@ -28,7 +28,8 @@
 #ifdef UFSECP_CUDA_ENABLED
 extern "C" {
 int UfsecpCudaDetect(int *num_gpus);
-void *UfsecpCudaLaunchBatch(const uint8_t *scan_key, const uint8_t *tweak_data, uint32_t count, int device_id);
+void *UfsecpCudaLaunchBatch(const uint8_t *scan_key, const uint8_t *tweak_data, uint32_t count, int device_id,
+                            const void *precomp);
 int UfsecpCudaRunKernels(void *state_handle, uint8_t *out_x, uint8_t *out_y, uint32_t count);
 void UfsecpCudaFreeBatch(void *state_handle);
 }
@@ -36,7 +37,8 @@ void UfsecpCudaFreeBatch(void *state_handle);
 #ifdef UFSECP_OPENCL_ENABLED
 extern "C" {
 int UfsecpOclDetect(int *num_gpus);
-void *UfsecpOclLaunchBatch(const uint8_t *scan_key, const uint8_t *tweak_data, uint32_t count, int device_id);
+void *UfsecpOclLaunchBatch(const uint8_t *scan_key, const uint8_t *tweak_data, uint32_t count, int device_id,
+                           const void *precomp);
 int UfsecpOclRunKernels(void *state_handle, uint8_t *out_x, uint8_t *out_y, uint32_t count);
 void UfsecpOclFreeBatch(void *state_handle);
 }
@@ -44,7 +46,8 @@ void UfsecpOclFreeBatch(void *state_handle);
 #ifdef UFSECP_METAL_ENABLED
 extern "C" {
 int UfsecpMetalDetect(int *num_gpus);
-void *UfsecpMetalLaunchBatch(const uint8_t *scan_key, const uint8_t *tweak_data, uint32_t count, int device_id);
+void *UfsecpMetalLaunchBatch(const uint8_t *scan_key, const uint8_t *tweak_data, uint32_t count, int device_id,
+                             const void *precomp);
 int UfsecpMetalRunKernels(void *state_handle, uint8_t *out_x, uint8_t *out_y, uint32_t count);
 void UfsecpMetalFreeBatch(void *state_handle);
 }
@@ -71,7 +74,7 @@ static bool g_gpu_detected = false;
 static std::mutex g_gpu_init_mutex;
 
 // Function pointers for the active GPU backend
-static void *(*g_gpu_launch)(const uint8_t *, const uint8_t *, uint32_t, int) = nullptr;
+static void *(*g_gpu_launch)(const uint8_t *, const uint8_t *, uint32_t, int, const void *) = nullptr;
 static int (*g_gpu_run)(void *, uint8_t *, uint8_t *, uint32_t) = nullptr;
 static void (*g_gpu_free)(void *) = nullptr;
 
@@ -497,10 +500,32 @@ static void ProcessBatchGpu(UfsecpScanLocalState &local_state, const UfsecpScanB
 		std::memcpy(tweak_buf.data() + i * 64, local_state.accumulated_tweak_keys[i].data(), 64);
 	}
 
+	// Build precomputed scan key plan for GPU (wNAF + GLV decomposition)
+	struct {
+		char wnaf1[130];
+		char wnaf2[130];
+		uint8_t k1_neg;
+		uint8_t flip_phi;
+		uint8_t pad0;
+		uint8_t pad1;
+	} scan_glv = {};
+	{
+		const auto &plan = bind_data.kplan;
+		size_t n1 = std::min(plan.wnaf1.size(), size_t(130));
+		size_t n2 = std::min(plan.wnaf2.size(), size_t(130));
+		for (size_t i = 0; i < n1; i++)
+			scan_glv.wnaf1[i] = static_cast<char>(plan.wnaf1[i]);
+		for (size_t i = 0; i < n2; i++)
+			scan_glv.wnaf2[i] = static_cast<char>(plan.wnaf2[i]);
+		scan_glv.k1_neg = plan.neg1 ? 1 : 0;
+		scan_glv.flip_phi = (plan.neg1 != plan.neg2) ? 1 : 0;
+	}
+
 	// Launch GPU batch
 	const uint8_t *scan_key = reinterpret_cast<const uint8_t *>(bind_data.scan_private_key_data.data());
 
-	void *gpu_state = g_gpu_launch(scan_key, tweak_buf.data(), static_cast<uint32_t>(N), local_state.assigned_gpu);
+	void *gpu_state =
+	    g_gpu_launch(scan_key, tweak_buf.data(), static_cast<uint32_t>(N), local_state.assigned_gpu, &scan_glv);
 
 	if (!gpu_state) {
 		// GPU launch failed — fall back to CPU

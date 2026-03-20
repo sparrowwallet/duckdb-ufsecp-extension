@@ -303,7 +303,9 @@ int UfsecpMetalDetect(int *num_gpus) {
     return 0;
 }
 
-void *UfsecpMetalLaunchBatch(const uint8_t *scan_key, const uint8_t *tweak_data, uint32_t count, int device_id) {
+void *UfsecpMetalLaunchBatch(const uint8_t *scan_key, const uint8_t *tweak_data, uint32_t count, int device_id,
+                             const void *precomp) {
+    (void)precomp; // Metal does its own on-device decomposition
     (void)device_id; // Metal runtime manages device selection
 
     if (!g_runtime || g_metal_device_count == 0)

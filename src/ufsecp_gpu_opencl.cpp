@@ -5,10 +5,10 @@
 // ProcessBatchGpu in ufsecp_extension.cpp works identically for both backends.
 //
 // Preferred path: LUT fused kernel (bip352_fused_kernel_lut)
-//   64 MB precomputed generator table, 15 additions for k*G.
+//   64 MB precomputed generator table + predecomposed scan key in __constant.
 //
 // Fallback path 1: GLV fused kernel (bip352_fused_kernel)
-//   All 5 phases in one dispatch using GLV generator multiplication.
+//   Predecomposed scan key + GLV generator multiplication.
 //
 // Fallback path 2: multi-dispatch pipeline
 //   4 GPU dispatches + 1 CPU phase (original approach).
@@ -65,10 +65,6 @@ static cl_mem g_ocl_gen_lut = nullptr;
 static bool g_ocl_lut_built = false;
 static std::mutex g_ocl_lut_mutex;
 
-// BIP0352/SharedSecret midstate as 8 x uint32_t for the fused GPU kernel
-static const uint32_t g_bip352_midstate[8] = {0x88831537U, 0x5127079bU, 0x69c2137bU, 0xab0303e6U,
-                                              0x98fa21faU, 0x4a888523U, 0xbd99daabU, 0xf25e5e0aU};
-
 // ============================================================================
 // Generator LUT construction (lazy, thread-safe)
 // ============================================================================
@@ -84,47 +80,29 @@ static void EnsureOclGenLutBuilt() {
 	auto *queue = static_cast<cl_command_queue>(g_ocl_ctx->native_queue());
 	cl_int err;
 
-	// AffinePoint = 64 bytes, FieldElement = 32 bytes
 	static constexpr int N = 65536;
 	static constexpr int SLICES = 16;
 	static constexpr int TOTAL = SLICES * N;
 	static constexpr size_t AFFINE_SIZE = 64;
 	static constexpr size_t FIELD_SIZE = 32;
 
-	// Allocate buffers (buffer creation doesn't touch the command queue)
 	cl_mem d_bases = clCreateBuffer(ctx, CL_MEM_READ_WRITE, SLICES * AFFINE_SIZE, nullptr, &err);
-	if (err != CL_SUCCESS) {
-		g_ocl_lut_built = true;
-		return;
-	}
+	if (err != CL_SUCCESS) { g_ocl_lut_built = true; return; }
 
 	cl_mem d_lut = clCreateBuffer(ctx, CL_MEM_READ_WRITE, (size_t)TOTAL * AFFINE_SIZE, nullptr, &err);
-	if (err != CL_SUCCESS) {
-		clReleaseMemObject(d_bases);
-		g_ocl_lut_built = true;
-		return;
-	}
+	if (err != CL_SUCCESS) { clReleaseMemObject(d_bases); g_ocl_lut_built = true; return; }
 
 	cl_mem d_h_buf = clCreateBuffer(ctx, CL_MEM_READ_WRITE, (size_t)TOTAL * FIELD_SIZE, nullptr, &err);
-	if (err != CL_SUCCESS) {
-		clReleaseMemObject(d_bases);
-		clReleaseMemObject(d_lut);
-		g_ocl_lut_built = true;
-		return;
-	}
+	if (err != CL_SUCCESS) { clReleaseMemObject(d_bases); clReleaseMemObject(d_lut); g_ocl_lut_built = true; return; }
 
-	// Lock the command queue for all GPU dispatches — OpenCL 1.2 queues
-	// are not thread-safe, and scan threads may be dispatching concurrently.
 	{
 		std::lock_guard<std::mutex> lock(g_ocl_mutex);
 
-		// Step 1: compute 16 base points
 		clSetKernelArg(g_lut_base_kernel, 0, sizeof(cl_mem), &d_bases);
 		size_t one = 1;
 		clEnqueueNDRangeKernel(queue, g_lut_base_kernel, 1, nullptr, &one, &one, 0, nullptr, nullptr);
 		clFinish(queue);
 
-		// Step 2: fused build + serial inversion (16 work-items)
 		clSetKernelArg(g_lut_build_kernel, 0, sizeof(cl_mem), &d_bases);
 		clSetKernelArg(g_lut_build_kernel, 1, sizeof(cl_mem), &d_lut);
 		clSetKernelArg(g_lut_build_kernel, 2, sizeof(cl_mem), &d_h_buf);
@@ -134,7 +112,6 @@ static void EnsureOclGenLutBuilt() {
 		clEnqueueNDRangeKernel(queue, g_lut_build_kernel, 1, nullptr, &build_global, &build_local, 0, nullptr, nullptr);
 		clFinish(queue);
 
-		// Step 3: parallel affine conversion
 		clSetKernelArg(g_lut_convert_kernel, 0, sizeof(cl_mem), &d_lut);
 		clSetKernelArg(g_lut_convert_kernel, 1, sizeof(cl_mem), &d_h_buf);
 		clSetKernelArg(g_lut_convert_kernel, 2, sizeof(int), &n_entries);
@@ -145,11 +122,9 @@ static void EnsureOclGenLutBuilt() {
 		clFinish(queue);
 	}
 
-	// Cleanup temp buffers
 	clReleaseMemObject(d_h_buf);
 	clReleaseMemObject(d_bases);
 
-	// Publish (race-safe: only set after table is fully populated)
 	g_ocl_gen_lut = d_lut;
 	g_ocl_lut_built = true;
 	fprintf(stderr, "[OpenCL] Generator LUT built (64 MB)\n");
@@ -162,10 +137,9 @@ static void EnsureOclGenLutBuilt() {
 struct UfsecpOclBatchState {
 	// Fused path: raw OpenCL buffers
 	cl_mem tweak_buf;
-	cl_mem scan_key_buf;
+	cl_mem scan_plan_buf;
 	cl_mem out_x_buf;
 	cl_mem out_y_buf;
-	cl_mem midstate_buf;
 
 	// Multi-dispatch fallback (existing fields)
 	std::vector<ocl::Scalar> scan_scalars;
@@ -271,7 +245,6 @@ int UfsecpOclDetect(int *num_gpus) {
 								fprintf(stderr, "[OpenCL] Fused BIP-352 kernel available\n");
 							}
 
-							// Try to create LUT kernels from the same program
 							cl_int lut_err;
 							g_lut_base_kernel = clCreateKernel(g_fused_program, "compute_lut_base_points", &lut_err);
 							if (lut_err == CL_SUCCESS)
@@ -314,7 +287,8 @@ int UfsecpOclDetect(int *num_gpus) {
 	return 0;
 }
 
-void *UfsecpOclLaunchBatch(const uint8_t *scan_key, const uint8_t *tweak_data, uint32_t count, int device_id) {
+void *UfsecpOclLaunchBatch(const uint8_t *scan_key, const uint8_t *tweak_data, uint32_t count, int device_id,
+                           const void *precomp) {
 	(void)device_id;
 
 	if (!g_ocl_ctx || !g_ocl_ctx->is_valid())
@@ -330,45 +304,26 @@ void *UfsecpOclLaunchBatch(const uint8_t *scan_key, const uint8_t *tweak_data, u
 
 		state->tweak_buf = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, count * 64,
 		                                  const_cast<uint8_t *>(tweak_data), &err);
-		if (err != CL_SUCCESS) {
-			delete state;
-			return nullptr;
-		}
+		if (err != CL_SUCCESS) { delete state; return nullptr; }
 
-		state->scan_key_buf =
-		    clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, 32, const_cast<uint8_t *>(scan_key), &err);
+		// Upload precomputed scan key plan (BIP352ScanKeyGlv = 264 bytes)
+		state->scan_plan_buf = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, 264,
+		                                     const_cast<void *>(precomp), &err);
 		if (err != CL_SUCCESS) {
 			clReleaseMemObject(state->tweak_buf);
-			delete state;
-			return nullptr;
+			delete state; return nullptr;
 		}
 
 		state->out_x_buf = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY, count * 32, nullptr, &err);
 		if (err != CL_SUCCESS) {
-			clReleaseMemObject(state->tweak_buf);
-			clReleaseMemObject(state->scan_key_buf);
-			delete state;
-			return nullptr;
+			clReleaseMemObject(state->tweak_buf); clReleaseMemObject(state->scan_plan_buf);
+			delete state; return nullptr;
 		}
 
 		state->out_y_buf = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY, count * 32, nullptr, &err);
 		if (err != CL_SUCCESS) {
-			clReleaseMemObject(state->tweak_buf);
-			clReleaseMemObject(state->scan_key_buf);
-			clReleaseMemObject(state->out_x_buf);
-			delete state;
-			return nullptr;
-		}
-
-		state->midstate_buf = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, 8 * sizeof(uint32_t),
-		                                     const_cast<uint32_t *>(g_bip352_midstate), &err);
-		if (err != CL_SUCCESS) {
-			clReleaseMemObject(state->tweak_buf);
-			clReleaseMemObject(state->scan_key_buf);
-			clReleaseMemObject(state->out_x_buf);
-			clReleaseMemObject(state->out_y_buf);
-			delete state;
-			return nullptr;
+			clReleaseMemObject(state->tweak_buf); clReleaseMemObject(state->scan_plan_buf);
+			clReleaseMemObject(state->out_x_buf); delete state; return nullptr;
 		}
 	} else {
 		ocl::Scalar scan_scalar = scalar_from_le(scan_key);
@@ -377,10 +332,9 @@ void *UfsecpOclLaunchBatch(const uint8_t *scan_key, const uint8_t *tweak_data, u
 		for (uint32_t i = 0; i < count; i++)
 			state->tweak_points[i] = affine_from_le(tweak_data + i * 64);
 		state->tweak_buf = nullptr;
-		state->scan_key_buf = nullptr;
+		state->scan_plan_buf = nullptr;
 		state->out_x_buf = nullptr;
 		state->out_y_buf = nullptr;
-		state->midstate_buf = nullptr;
 	}
 
 	return state;
@@ -397,46 +351,38 @@ int UfsecpOclRunKernels(void *state_handle, uint8_t *out_x, uint8_t *out_y, uint
 	if (state->use_fused) {
 		auto *queue = static_cast<cl_command_queue>(g_ocl_ctx->native_queue());
 
-		// Build LUT on first use (lazy, thread-safe)
-		if (g_use_lut)
-			EnsureOclGenLutBuilt();
+		if (g_use_lut) EnsureOclGenLutBuilt();
 
-		// Lock around setargs + enqueue to prevent concurrent threads from
-		// interleaving kernel arguments on the shared cl_kernel object.
 		std::lock_guard<std::mutex> lock(g_ocl_mutex);
 
 		cl_kernel kernel;
 		if (g_ocl_gen_lut) {
-			// LUT path: 7 args
+			// LUT path: 5 args
 			kernel = g_fused_kernel_lut;
 			clSetKernelArg(kernel, 0, sizeof(cl_mem), &state->tweak_buf);
-			clSetKernelArg(kernel, 1, sizeof(cl_mem), &state->scan_key_buf);
+			clSetKernelArg(kernel, 1, sizeof(cl_mem), &state->scan_plan_buf);
 			clSetKernelArg(kernel, 2, sizeof(cl_mem), &state->out_x_buf);
 			clSetKernelArg(kernel, 3, sizeof(cl_mem), &state->out_y_buf);
-			clSetKernelArg(kernel, 4, sizeof(cl_mem), &state->midstate_buf);
-			clSetKernelArg(kernel, 5, sizeof(cl_mem), &g_ocl_gen_lut);
-			clSetKernelArg(kernel, 6, sizeof(uint32_t), &count);
+			clSetKernelArg(kernel, 4, sizeof(cl_mem), &g_ocl_gen_lut);
+			clSetKernelArg(kernel, 5, sizeof(uint32_t), &count);
 		} else {
-			// GLV fallback: 6 args
+			// GLV fallback: 4 args
 			kernel = g_fused_kernel;
 			clSetKernelArg(kernel, 0, sizeof(cl_mem), &state->tweak_buf);
-			clSetKernelArg(kernel, 1, sizeof(cl_mem), &state->scan_key_buf);
+			clSetKernelArg(kernel, 1, sizeof(cl_mem), &state->scan_plan_buf);
 			clSetKernelArg(kernel, 2, sizeof(cl_mem), &state->out_x_buf);
 			clSetKernelArg(kernel, 3, sizeof(cl_mem), &state->out_y_buf);
-			clSetKernelArg(kernel, 4, sizeof(cl_mem), &state->midstate_buf);
-			clSetKernelArg(kernel, 5, sizeof(uint32_t), &count);
+			clSetKernelArg(kernel, 4, sizeof(uint32_t), &count);
 		}
 
 		size_t local_size = 256;
 		clGetKernelWorkGroupInfo(kernel, nullptr, CL_KERNEL_WORK_GROUP_SIZE, sizeof(local_size), &local_size, nullptr);
-		if (local_size > 256)
-			local_size = 256;
+		if (local_size > 256) local_size = 256;
 
 		size_t global_size = ((size_t)count + local_size - 1) / local_size * local_size;
 
 		cl_int err = clEnqueueNDRangeKernel(queue, kernel, 1, nullptr, &global_size, &local_size, 0, nullptr, nullptr);
-		if (err != CL_SUCCESS)
-			return -1;
+		if (err != CL_SUCCESS) return -1;
 
 		clEnqueueReadBuffer(queue, state->out_x_buf, CL_TRUE, 0, count * 32, out_x, 0, nullptr, nullptr);
 		clEnqueueReadBuffer(queue, state->out_y_buf, CL_TRUE, 0, count * 32, out_y, 0, nullptr, nullptr);
@@ -484,16 +430,10 @@ void UfsecpOclFreeBatch(void *state_handle) {
 	if (!state_handle)
 		return;
 	auto *state = static_cast<UfsecpOclBatchState *>(state_handle);
-	if (state->tweak_buf)
-		clReleaseMemObject(state->tweak_buf);
-	if (state->scan_key_buf)
-		clReleaseMemObject(state->scan_key_buf);
-	if (state->out_x_buf)
-		clReleaseMemObject(state->out_x_buf);
-	if (state->out_y_buf)
-		clReleaseMemObject(state->out_y_buf);
-	if (state->midstate_buf)
-		clReleaseMemObject(state->midstate_buf);
+	if (state->tweak_buf) clReleaseMemObject(state->tweak_buf);
+	if (state->scan_plan_buf) clReleaseMemObject(state->scan_plan_buf);
+	if (state->out_x_buf) clReleaseMemObject(state->out_x_buf);
+	if (state->out_y_buf) clReleaseMemObject(state->out_y_buf);
 	delete state;
 }
 
