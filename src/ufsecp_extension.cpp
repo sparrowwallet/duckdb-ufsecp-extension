@@ -56,6 +56,11 @@ void UfsecpOclFreeBatch(void *state_handle);
 #ifdef UFSECP_METAL_ENABLED
 extern "C" {
 int UfsecpMetalDetect(int *num_gpus);
+void UfsecpMetalSetSpendKey(const uint8_t *spend_xy, int num_labels, const uint8_t *label_keys_xy, int device_id);
+void *UfsecpMetalLaunchBatchFull(const uint8_t *tweak_data, const int64_t *output_prefixes, uint32_t total_outputs,
+                                 const uint32_t *output_offsets, const uint8_t *output_lengths, uint32_t count,
+                                 int device_id, const void *precomp);
+int UfsecpMetalRunKernelsFull(void *state_handle, uint8_t *match_flags, uint32_t count);
 void *UfsecpMetalLaunchBatch(const uint8_t *scan_key, const uint8_t *tweak_data, uint32_t count, int device_id,
                              const void *precomp);
 int UfsecpMetalRunKernels(void *state_handle, uint8_t *out_x, uint8_t *out_y, uint32_t count);
@@ -145,6 +150,9 @@ static void EnsureGpuDetected() {
 		if (metal_gpus > 0) {
 			g_num_gpus = metal_gpus;
 			g_gpu_backend = GpuBackend::METAL;
+			g_gpu_set_spend = UfsecpMetalSetSpendKey;
+			g_gpu_launch_full = UfsecpMetalLaunchBatchFull;
+			g_gpu_run_full = UfsecpMetalRunKernelsFull;
 			g_gpu_launch = UfsecpMetalLaunchBatch;
 			g_gpu_run = UfsecpMetalRunKernels;
 			g_gpu_free = UfsecpMetalFreeBatch;

@@ -79,6 +79,12 @@ static mtl::ComputePipeline g_lut_convert_pipeline;
 // LUT fused kernel pipeline
 static mtl::ComputePipeline g_fused_lut_pipeline;
 
+// Full pipeline state (phases 1-6)
+static mtl::MetalBuffer g_spend_buf;
+static bool g_spend_uploaded = false;
+static mtl::ComputePipeline g_full_pass1_pipeline;
+static mtl::ComputePipeline g_batch_inv_pipeline;
+
 // ============================================================================
 // Per-batch state (allocated in LaunchBatch, freed in FreeBatch)
 // ============================================================================
@@ -92,12 +98,23 @@ struct UfsecpMetalBatchState {
     mtl::MetalBuffer midstate_buf;
     mtl::MetalBuffer count_buf;
 
+    // Full pipeline fields (phases 1-6)
+    mtl::MetalBuffer output_prefixes_buf;
+    mtl::MetalBuffer output_offsets_buf;
+    mtl::MetalBuffer output_lengths_buf;
+    mtl::MetalBuffer match_flags_buf;
+    mtl::MetalBuffer cand_x_buf;
+    mtl::MetalBuffer cand_z_buf;
+    mtl::MetalBuffer output_pts_buf;
+    mtl::MetalBuffer scratch_buf;
+
     // Multi-dispatch fallback (existing fields)
     std::vector<mtl::HostScalar> scan_scalars;
     std::vector<mtl::HostAffinePoint> tweak_points;
 
     uint32_t count;
     bool use_fused;
+    bool full_pipeline = false;
 };
 
 // ============================================================================
@@ -281,10 +298,12 @@ int UfsecpMetalDetect(int *num_gpus) {
 
                 // Try to create the fused pipeline
                 g_fused_pipeline = g_runtime->make_pipeline("bip352_fused_kernel");
+                // Compute BIP352 midstate for GPU kernels
+                compute_bip352_midstate(g_bip352_midstate);
+
                 g_use_fused = g_fused_pipeline.valid();
                 if (g_use_fused) {
                     fprintf(stderr, "[Metal] Fused BIP-352 kernel available\n");
-                    compute_bip352_midstate(g_bip352_midstate);
                 } else {
                     fprintf(stderr,
                         "[Metal] Fused kernel unavailable, using multi-dispatch fallback\n");
@@ -295,6 +314,12 @@ int UfsecpMetalDetect(int *num_gpus) {
                 g_lut_build_pipeline = g_runtime->make_pipeline("gen_lut_build_affine");
                 g_lut_convert_pipeline = g_runtime->make_pipeline("gen_lut_convert_zinv");
                 g_fused_lut_pipeline = g_runtime->make_pipeline("bip352_fused_kernel_lut");
+
+                // Full pipeline kernels (phases 1-6)
+                g_full_pass1_pipeline = g_runtime->make_pipeline("bip352_full_pass1");
+                g_batch_inv_pipeline = g_runtime->make_pipeline("bip352_batch_inv_match");
+                if (g_full_pass1_pipeline.valid() && g_batch_inv_pipeline.valid())
+                    fprintf(stderr, "[Metal] Full pipeline kernels available\n");
             }
         }
         g_metal_initialized = true;
@@ -460,6 +485,136 @@ void UfsecpMetalFreeBatch(void *state_handle) {
     if (!state_handle)
         return;
     delete static_cast<UfsecpMetalBatchState *>(state_handle);
+}
+
+// ============================================================================
+// Full pipeline: phases 1-6 on GPU (spend key + batch inversion + matching)
+// ============================================================================
+
+void UfsecpMetalSetSpendKey(const uint8_t *spend_xy, int num_labels,
+                            const uint8_t *label_keys_xy, int device_id) {
+    (void)device_id;
+    if (!g_runtime) return;
+
+    // BIP352SpendKeys: base(64) + labels[16](1024) + num_labels(1) + pad(3) = 1092
+    static constexpr size_t SPEND_SIZE = 64 + 16 * 64 + 4;
+    uint8_t spend_data[SPEND_SIZE] = {};
+
+    std::memcpy(spend_data, spend_xy, 64);
+
+    int n = (num_labels > 16) ? 16 : num_labels;
+    if (label_keys_xy && n > 0)
+        std::memcpy(spend_data + 64, label_keys_xy, n * 64);
+
+    spend_data[64 + 16 * 64] = (uint8_t)n;
+
+    g_spend_buf = g_runtime->alloc_buffer(SPEND_SIZE);
+    std::memcpy(g_spend_buf.contents(), spend_data, SPEND_SIZE);
+    g_spend_uploaded = true;
+}
+
+void *UfsecpMetalLaunchBatchFull(
+    const uint8_t *tweak_data, const int64_t *output_prefixes, uint32_t total_outputs,
+    const uint32_t *output_offsets, const uint8_t *output_lengths,
+    uint32_t count, int device_id, const void *precomp) {
+    (void)device_id;
+
+    if (!g_runtime || g_metal_device_count == 0 ||
+        !g_full_pass1_pipeline.valid() || !g_batch_inv_pipeline.valid() ||
+        !g_spend_uploaded)
+        return nullptr;
+
+    auto *state = new UfsecpMetalBatchState();
+    state->count = count;
+    state->full_pipeline = true;
+    state->use_fused = false;
+
+    // Tweak data + scan plan
+    state->tweak_buf = g_runtime->alloc_buffer((size_t)count * 64);
+    state->scan_plan_buf = g_runtime->alloc_buffer(264);
+    std::memcpy(state->tweak_buf.contents(), tweak_data, (size_t)count * 64);
+    std::memcpy(state->scan_plan_buf.contents(), precomp, 264);
+
+    // Output prefix data
+    state->output_prefixes_buf = g_runtime->alloc_buffer(
+        (size_t)total_outputs * sizeof(int64_t));
+    state->output_offsets_buf = g_runtime->alloc_buffer(
+        (size_t)count * sizeof(uint32_t));
+    state->output_lengths_buf = g_runtime->alloc_buffer((size_t)count);
+    std::memcpy(state->output_prefixes_buf.contents(), output_prefixes,
+                (size_t)total_outputs * sizeof(int64_t));
+    std::memcpy(state->output_offsets_buf.contents(), output_offsets,
+                (size_t)count * sizeof(uint32_t));
+    std::memcpy(state->output_lengths_buf.contents(), output_lengths,
+                (size_t)count);
+
+    // Intermediate buffers
+    state->cand_x_buf = g_runtime->alloc_buffer((size_t)count * FIELD_ELEMENT_SIZE);
+    state->cand_z_buf = g_runtime->alloc_buffer((size_t)count * FIELD_ELEMENT_SIZE);
+
+    // JacobianPoint in Metal: 3*FieldElement(32) + uint(4) = 100 bytes
+    static constexpr size_t JACOBIAN_POINT_SIZE = 3 * 32 + 4;
+    state->output_pts_buf = g_runtime->alloc_buffer(
+        (size_t)count * JACOBIAN_POINT_SIZE);
+
+    // Match flags
+    state->match_flags_buf = g_runtime->alloc_buffer((size_t)count);
+
+    // Midstate + count
+    state->midstate_buf = g_runtime->alloc_buffer(8 * sizeof(uint32_t));
+    state->count_buf = g_runtime->alloc_buffer(sizeof(uint32_t));
+    std::memcpy(state->midstate_buf.contents(), g_bip352_midstate, 32);
+    state->count_buf.write(&count, 1);
+
+    // Scratch buffer for batch inversion (device memory instead of threadgroup)
+    // 2 * tgsize * FIELD_ELEMENT_SIZE per threadgroup
+    uint32_t tgsize = 256;
+    uint32_t num_threadgroups = (count + tgsize - 1) / tgsize;
+    size_t scratch_size = (size_t)num_threadgroups * 2 * tgsize * FIELD_ELEMENT_SIZE;
+    state->scratch_buf = g_runtime->alloc_buffer(scratch_size);
+
+    return state;
+}
+
+int UfsecpMetalRunKernelsFull(void *state_handle, uint8_t *match_flags, uint32_t count) {
+    auto *state = static_cast<UfsecpMetalBatchState *>(state_handle);
+    if (!state || !g_runtime) return -1;
+
+    EnsureGenLutBuilt();
+    if (!g_lut_available) return -1;
+
+    // Pass 1: phases 1-5
+    {
+        std::lock_guard<std::mutex> lock(g_metal_mutex);
+        uint32_t tg = g_full_pass1_pipeline.threadExecutionWidth();
+        if (tg == 0) tg = 128;
+        std::vector<mtl::MetalBuffer *> bufs = {
+            &state->tweak_buf, &state->scan_plan_buf,
+            &g_gen_lut_buf, &g_spend_buf,
+            &state->midstate_buf,
+            &state->cand_x_buf, &state->cand_z_buf,
+            &state->output_pts_buf, &state->count_buf
+        };
+        g_runtime->dispatch_sync(g_full_pass1_pipeline, state->count, tg, bufs);
+    }
+
+    // Pass 2: batch inversion + matching
+    {
+        std::lock_guard<std::mutex> lock(g_metal_mutex);
+        uint32_t tg = 256;
+        std::vector<mtl::MetalBuffer *> bufs = {
+            &state->cand_x_buf, &state->cand_z_buf,
+            &state->output_pts_buf, &g_spend_buf,
+            &state->output_prefixes_buf, &state->output_offsets_buf,
+            &state->output_lengths_buf, &state->match_flags_buf,
+            &state->count_buf, &state->scratch_buf
+        };
+        g_runtime->dispatch_sync(g_batch_inv_pipeline, state->count, tg, bufs);
+    }
+
+    // Read match flags (unified memory — direct access)
+    std::memcpy(match_flags, state->match_flags_buf.contents(), state->count);
+    return 0;
 }
 
 } // extern "C"

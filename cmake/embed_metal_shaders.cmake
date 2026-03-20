@@ -515,6 +515,249 @@ kernel void bip352_fused_kernel_lut(
         dst_y[i] = oy_be[31 - i];
     }
 }
+
+// =============================================================================
+// BIP352SpendKeys: spend key + label keys for full pipeline
+// =============================================================================
+
+#define MAX_LABEL_KEYS 16
+
+struct BIP352SpendKeys {
+    AffinePoint base;
+    AffinePoint labels[MAX_LABEL_KEYS];
+    uchar num_labels;
+    uchar pad[3];
+};
+
+// =============================================================================
+// Full pipeline pass 1: phases 1-5 per thread
+// =============================================================================
+
+kernel void bip352_full_pass1(
+    device const uchar *tweak_xy          [[buffer(0)]],
+    constant const BIP352ScanKeyGlv &scan_plan [[buffer(1)]],
+    device const AffinePoint *gen_lut     [[buffer(2)]],
+    constant const BIP352SpendKeys &spend [[buffer(3)]],
+    constant uint *tag_midstate           [[buffer(4)]],
+    device FieldElement *cand_x           [[buffer(5)]],
+    device FieldElement *cand_z           [[buffer(6)]],
+    device JacobianPoint *output_pts      [[buffer(7)]],
+    constant uint &count                  [[buffer(8)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= count) return;
+
+    // Phase 0: Load tweak point (LE wire -> internal)
+    device const uchar *tweak = tweak_xy + tid * 64;
+    FieldElement fx, fy;
+    for (int i = 0; i < 8; i++) {
+        int base = i * 4;
+        fx.limbs[i] = (uint(tweak[base]) | (uint(tweak[base+1]) << 8) |
+                       (uint(tweak[base+2]) << 16) | (uint(tweak[base+3]) << 24));
+        fy.limbs[i] = (uint(tweak[32 + base]) | (uint(tweak[32 + base+1]) << 8) |
+                       (uint(tweak[32 + base+2]) << 16) | (uint(tweak[32 + base+3]) << 24));
+    }
+    AffinePoint tweak_pt;
+    tweak_pt.x = fx;
+    tweak_pt.y = fy;
+
+    // Phase 1: shared_secret = scan_key * tweak_point
+    JacobianPoint shared_jac = scalar_mul_glv_predecomp(tweak_pt, scan_plan);
+    AffinePoint shared_aff = jacobian_to_affine(shared_jac);
+
+    // Phase 2: serialize SEC1 compressed + 4 zero bytes
+    uchar x_bytes[32], y_bytes[32];
+    field_to_bytes(shared_aff.x, x_bytes);
+    field_to_bytes(shared_aff.y, y_bytes);
+
+    uchar ser[37];
+    ser[0] = (y_bytes[31] & 1) ? 0x03 : 0x02;
+    for (int i = 0; i < 32; i++) ser[i + 1] = x_bytes[i];
+    ser[33] = 0; ser[34] = 0; ser[35] = 0; ser[36] = 0;
+
+    // Phase 3: tagged SHA-256
+    SHA256Ctx ctx;
+    for (int i = 0; i < 8; i++) ctx.h[i] = tag_midstate[i];
+    ctx.buf_len = 0;
+    ctx.total_len_lo = 64;
+    ctx.total_len_hi = 0;
+    sha256_update(ctx, ser, 37);
+    uchar hash[32];
+    sha256_final(ctx, hash);
+
+    // Phase 4: output_point = hash * G via LUT
+    Scalar256 hs = scalar_from_bytes(hash);
+    JacobianPoint out_jac = scalar_mul_generator_lut(hs, gen_lut);
+
+    // Store output point for label processing
+    output_pts[tid] = out_jac;
+
+    // Phase 5: candidate = output_point + spend_key
+    AffinePoint spend_base = spend.base;
+    JacobianPoint candidate = jacobian_add_mixed(out_jac, spend_base);
+
+    cand_x[tid] = candidate.x;
+    cand_z[tid] = candidate.z;
+}
+
+// =============================================================================
+// Batch inversion helpers (using device memory buffers)
+// =============================================================================
+
+inline void metal_block_prefix_mul(device FieldElement *data, uint tid, uint n) {
+    for (uint offset = 1; offset < n; offset *= 2) {
+        FieldElement val;
+        bool do_write = false;
+        if (tid >= offset && tid < n) {
+            FieldElement a = data[tid - offset];
+            FieldElement b = data[tid];
+            val = field_mul(a, b);
+            do_write = true;
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+        if (do_write) data[tid] = val;
+        threadgroup_barrier(mem_flags::mem_device);
+    }
+}
+
+inline void metal_block_suffix_mul(device FieldElement *data, uint tid, uint n) {
+    for (uint offset = 1; offset < n; offset *= 2) {
+        FieldElement val;
+        bool do_write = false;
+        if (tid + offset < n) {
+            FieldElement a = data[tid + offset];
+            FieldElement b = data[tid];
+            val = field_mul(a, b);
+            do_write = true;
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+        if (do_write) data[tid] = val;
+        threadgroup_barrier(mem_flags::mem_device);
+    }
+}
+
+inline void metal_block_batch_invert(
+    FieldElement z_val,
+    thread FieldElement &z_inv_out,
+    device FieldElement *L,
+    device FieldElement *R,
+    uint tid,
+    uint valid_in_block)
+{
+    L[tid] = z_val;
+    R[tid] = z_val;
+    threadgroup_barrier(mem_flags::mem_device);
+
+    metal_block_prefix_mul(L, tid, valid_in_block);
+    metal_block_suffix_mul(R, tid, valid_in_block);
+
+    // Thread 0 computes total inverse and broadcasts via R[0]
+    if (tid == 0 && valid_in_block > 0) {
+        FieldElement total_prod = L[valid_in_block - 1];
+        FieldElement inv_result = field_inv(total_prod);
+        R[0] = inv_result;
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+
+    FieldElement total_inv = R[0];
+
+    FieldElement z_inv = total_inv;
+    if (tid > 0) {
+        FieldElement lprev = L[tid - 1];
+        z_inv = field_mul(z_inv, lprev);
+    }
+    if (tid < valid_in_block - 1) {
+        FieldElement rnext = R[tid + 1];
+        z_inv = field_mul(z_inv, rnext);
+    }
+
+    z_inv_out = z_inv;
+    threadgroup_barrier(mem_flags::mem_device);
+}
+
+inline long metal_extract_prefix(thread const FieldElement &jac_x, thread const FieldElement &z_inv) {
+    FieldElement z_inv2 = field_sqr(z_inv);
+    FieldElement ax = field_mul(jac_x, z_inv2);
+    uchar x_bytes[32];
+    field_to_bytes(ax, x_bytes);
+    long pfx = 0;
+    for (int i = 0; i < 8; i++) pfx = (pfx << 8) | long(x_bytes[i]);
+    return pfx;
+}
+
+// =============================================================================
+// Full pipeline pass 2: batch inversion + prefix match
+// =============================================================================
+
+kernel void bip352_batch_inv_match(
+    device const FieldElement *cand_x       [[buffer(0)]],
+    device const FieldElement *cand_z       [[buffer(1)]],
+    device const JacobianPoint *output_pts  [[buffer(2)]],
+    constant const BIP352SpendKeys &spend   [[buffer(3)]],
+    device const long *output_prefixes      [[buffer(4)]],
+    device const uint *output_offsets       [[buffer(5)]],
+    device const uchar *output_lengths      [[buffer(6)]],
+    device uchar *match_flags               [[buffer(7)]],
+    constant uint &count                    [[buffer(8)]],
+    device FieldElement *scratch_buf        [[buffer(9)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint gid [[thread_position_in_grid]],
+    uint tgsize [[threads_per_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]]
+) {
+    // Each threadgroup gets its own slice of scratch_buf
+    uint tg_offset = tgid * tgsize * 2;
+    device FieldElement *L = scratch_buf + tg_offset;
+    device FieldElement *R = scratch_buf + tg_offset + tgsize;
+
+    uint group_start = gid - tid;
+    uint valid_in_block = min(count - group_start, tgsize);
+    bool valid = (gid < count);
+
+    uint off = valid ? output_offsets[gid] : 0;
+    uint len = valid ? output_lengths[gid] : 0;
+    bool found = false;
+
+    // Round 1: base spend key (batch-invert candidate Z)
+    {
+        FieldElement z_val = valid ? cand_z[gid] : field_one();
+        FieldElement z_inv;
+        metal_block_batch_invert(z_val, z_inv, L, R, tid, valid_in_block);
+
+        if (valid && !found) {
+            FieldElement cx = cand_x[gid];
+            long pfx = metal_extract_prefix(cx, z_inv);
+            for (uint j = 0; j < len && !found; j++)
+                if (output_prefixes[off + j] == pfx) found = true;
+        }
+    }
+
+    // Rounds 2+: label keys
+    for (uchar lbl = 0; lbl < spend.num_labels; lbl++) {
+        threadgroup_barrier(mem_flags::mem_device);
+
+        FieldElement label_z = field_one();
+        FieldElement label_cx;
+        if (valid) {
+            JacobianPoint op = output_pts[gid];
+            AffinePoint lkey = spend.labels[lbl];
+            JacobianPoint label_cand = jacobian_add_mixed(op, lkey);
+            label_cx = label_cand.x;
+            label_z = label_cand.z;
+        }
+
+        FieldElement label_z_inv;
+        metal_block_batch_invert(label_z, label_z_inv, L, R, tid, valid_in_block);
+
+        if (valid && !found) {
+            long label_pfx = metal_extract_prefix(label_cx, label_z_inv);
+            for (uint j = 0; j < len && !found; j++)
+                if (output_prefixes[off + j] == label_pfx) found = true;
+        }
+    }
+
+    if (valid) match_flags[gid] = found ? 1 : 0;
+}
 ")
 
 # Write as C++ raw string literal header
