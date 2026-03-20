@@ -32,6 +32,8 @@ foreach(FILE ${SHADER_FILES})
     string(APPEND COMBINED "${CONTENT}\n")
 endforeach()
 
+# Keep the w=16 LUT defines from secp256k1_extended.h as-is (scalar_mul_generator_lut uses them)
+
 # Append inline kernel definitions (matching secp256k1_kernels.metal signatures)
 string(APPEND COMBINED "
 // =============================================================================
@@ -65,16 +67,95 @@ kernel void generator_mul_batch(
     results[tid] = jacobian_to_affine(jac);
 }
 
-// scalar_mul_generator_lut is defined in secp256k1_extended.h (included above)
+// =============================================================================
+// BIP352ScanKeyGlv: precomputed GLV scan-key plan (264 bytes, matches host struct)
+// =============================================================================
 
-constant int GEN_LUT_N = 65536;
-constant int GEN_LUT_SLICES = 16;
+struct BIP352ScanKeyGlv {
+    char wnaf1[130];
+    char wnaf2[130];
+    uchar k1_neg;
+    uchar flip_phi;
+    uchar pad0;
+    uchar pad1;
+};
+
+// =============================================================================
+// derive_endo_table: build endomorphism table phi(P) for 8 affine points
+// =============================================================================
+
+inline void derive_endo_table(thread const AffinePoint *tbl, thread AffinePoint *endo_tbl, int negate_y) {
+    FieldElement beta;
+    for (int i = 0; i < 8; i++) beta.limbs[i] = BETA_LIMBS[i];
+    for (int i = 0; i < 8; i++) {
+        endo_tbl[i].x = field_mul(tbl[i].x, beta);
+        endo_tbl[i].y = negate_y ? field_negate(tbl[i].y) : tbl[i].y;
+    }
+}
+
+// =============================================================================
+// scalar_mul_glv_predecomp: GLV scalar mul with precomputed wNAF plan
+// =============================================================================
+
+inline JacobianPoint scalar_mul_glv_predecomp(thread const AffinePoint &base,
+                                               constant const BIP352ScanKeyGlv &scan) {
+    AffinePoint P = base;
+    if (scan.k1_neg) P.y = field_negate(P.y);
+
+    AffinePoint tbl[8];
+    FieldElement globalz;
+    build_wnaf_table_zr(P, tbl, 8, globalz);
+
+    AffinePoint endo_tbl[8];
+    derive_endo_table(tbl, endo_tbl, scan.flip_phi);
+
+    JacobianPoint R = point_at_infinity();
+    for (int i = 129; i >= 0; --i) {
+        if (R.infinity == 0) R = jacobian_double(R);
+
+        int d1 = scan.wnaf1[i];
+        if (d1 != 0) {
+            int idx = (((d1 > 0) ? d1 : -d1) - 1) >> 1;
+            AffinePoint pt = tbl[idx];
+            if (d1 < 0) pt.y = field_negate(pt.y);
+            if (R.infinity != 0) {
+                R.x = pt.x; R.y = pt.y; R.z = field_one(); R.infinity = 0;
+            } else {
+                R = jacobian_add_mixed(R, pt);
+            }
+        }
+
+        int d2 = scan.wnaf2[i];
+        if (d2 != 0) {
+            int idx = (((d2 > 0) ? d2 : -d2) - 1) >> 1;
+            AffinePoint pt = endo_tbl[idx];
+            if (d2 < 0) pt.y = field_negate(pt.y);
+            if (R.infinity != 0) {
+                R.x = pt.x; R.y = pt.y; R.z = field_one(); R.infinity = 0;
+            } else {
+                R = jacobian_add_mixed(R, pt);
+            }
+        }
+    }
+
+    if (R.infinity == 0) R.z = field_mul(R.z, globalz);
+    return R;
+}
+
+// =============================================================================
+// Generator LUT constants (w=16: 16 slices x 65536 entries = 64 MB)
+// =============================================================================
+
+// scalar_mul_generator_lut is defined in secp256k1_extended.h (w=16, included above)
+
+constant int GEN_LUT_N = GEN_LUT_ENTRIES;     // 65536
+constant int GEN_LUT_SLICES_COUNT = GEN_LUT_WINDOWS; // 16
 
 // =============================================================================
 // Generator LUT build kernels
 // =============================================================================
 
-// Kernel 1: Compute base points B_i = 2^(16*i) * G for i=0..15
+// Kernel 1: Compute base points B_i = 2^(GEN_LUT_WINDOW_BITS*i) * G for i=0..15
 kernel void compute_lut_base_points(
     device AffinePoint *bases    [[buffer(0)]],
     uint tid [[thread_position_in_grid]])
@@ -87,8 +168,8 @@ kernel void compute_lut_base_points(
     AffinePoint g = generator_affine();
     p.x = g.x; p.y = g.y; p.z = field_one(); p.infinity = 0;
 
-    for (int i = 1; i < GEN_LUT_SLICES; i++) {
-        for (int d = 0; d < 16; d++)
+    for (int i = 1; i < GEN_LUT_SLICES_COUNT; i++) {
+        for (int d = 0; d < GEN_LUT_WINDOW_BITS; d++)
             p = jacobian_double(p);
 
         AffinePoint aff = jacobian_to_affine(p);
@@ -107,7 +188,7 @@ kernel void gen_lut_build_affine(
     constant int &n_entries              [[buffer(3)]],
     uint slice [[threadgroup_position_in_grid]])
 {
-    if (slice >= (uint)GEN_LUT_SLICES) return;
+    if (slice >= (uint)GEN_LUT_SLICES_COUNT) return;
 
     int offset = int(slice) * n_entries;
     device FieldElement *h = h_buf + int(slice) * n_entries;
@@ -147,7 +228,7 @@ kernel void gen_lut_convert_zinv(
     uint gid [[thread_position_in_grid]])
 {
     int per_slice = n_entries - 2;
-    int total = GEN_LUT_SLICES * per_slice;
+    int total = GEN_LUT_SLICES_COUNT * per_slice;
     if (gid >= (uint)total) return;
 
     int slice = int(gid) / per_slice;
@@ -270,12 +351,12 @@ inline JacobianPoint scalar_mul_generator_glv_const(thread const Scalar256 &k) {
 // =============================================================================
 
 kernel void bip352_fused_kernel(
-    device const uchar *tweak_xy     [[buffer(0)]],   // N x 64 bytes (LE)
-    constant uchar *scan_key         [[buffer(1)]],   // 32 bytes (LE)
-    device uchar *out_x              [[buffer(2)]],   // N x 32 bytes (LE output)
-    device uchar *out_y              [[buffer(3)]],   // N x 32 bytes (LE output)
-    constant uint *tag_midstate      [[buffer(4)]],   // 8 x uint32_t
-    constant uint &count             [[buffer(5)]],
+    device const uchar *tweak_xy          [[buffer(0)]],   // N x 64 bytes (LE)
+    constant const BIP352ScanKeyGlv &scan_plan [[buffer(1)]],   // 264 bytes predecomp
+    device uchar *out_x                   [[buffer(2)]],   // N x 32 bytes (LE output)
+    device uchar *out_y                   [[buffer(3)]],   // N x 32 bytes (LE output)
+    constant uint *tag_midstate           [[buffer(4)]],   // 8 x uint32_t
+    constant uint &count                  [[buffer(5)]],
     uint tid [[thread_position_in_grid]]
 ) {
     if (tid >= count) return;
@@ -285,7 +366,6 @@ kernel void bip352_fused_kernel(
     // ------------------------------------------------------------------
 
     // Load tweak point: LE bytes -> FieldElement (8x uint32 LE limbs)
-    // Each u32 limb = 4 consecutive LE bytes
     device const uchar *tweak = tweak_xy + tid * 64;
     FieldElement fx, fy;
     for (int i = 0; i < 8; i++) {
@@ -299,15 +379,10 @@ kernel void bip352_fused_kernel(
     tweak_pt.x = fx;
     tweak_pt.y = fy;
 
-    // Load scan key: 32 LE bytes -> reverse to 32 BE bytes -> scalar_from_bytes
-    uchar sk_be[32];
-    for (int i = 0; i < 32; i++) sk_be[i] = scan_key[31 - i];
-    Scalar256 sk = scalar_from_bytes(sk_be);
-
     // ------------------------------------------------------------------
-    // Phase 1: shared_secret = scan_key * tweak_point
+    // Phase 1: shared_secret = scan_key * tweak_point (predecomposed GLV)
     // ------------------------------------------------------------------
-    JacobianPoint shared_jac = scalar_mul_glv(tweak_pt, sk);
+    JacobianPoint shared_jac = scalar_mul_glv_predecomp(tweak_pt, scan_plan);
     AffinePoint shared_aff = jacobian_to_affine(shared_jac);
 
     // ------------------------------------------------------------------
@@ -362,13 +437,13 @@ kernel void bip352_fused_kernel(
 // =============================================================================
 
 kernel void bip352_fused_kernel_lut(
-    device const uchar *tweak_xy     [[buffer(0)]],
-    constant uchar *scan_key         [[buffer(1)]],
-    device uchar *out_x              [[buffer(2)]],
-    device uchar *out_y              [[buffer(3)]],
-    constant uint *tag_midstate      [[buffer(4)]],
-    constant uint &count             [[buffer(5)]],
-    device const AffinePoint *gen_lut [[buffer(6)]],
+    device const uchar *tweak_xy          [[buffer(0)]],
+    constant const BIP352ScanKeyGlv &scan_plan [[buffer(1)]],
+    device uchar *out_x                   [[buffer(2)]],
+    device uchar *out_y                   [[buffer(3)]],
+    constant uint *tag_midstate           [[buffer(4)]],
+    constant uint &count                  [[buffer(5)]],
+    device const AffinePoint *gen_lut     [[buffer(6)]],
     uint tid [[thread_position_in_grid]]
 ) {
     if (tid >= count) return;
@@ -389,14 +464,10 @@ kernel void bip352_fused_kernel_lut(
     tweak_pt.x = fx;
     tweak_pt.y = fy;
 
-    uchar sk_be[32];
-    for (int i = 0; i < 32; i++) sk_be[i] = scan_key[31 - i];
-    Scalar256 sk = scalar_from_bytes(sk_be);
-
     // ------------------------------------------------------------------
-    // Phase 1: shared_secret = scan_key * tweak_point
+    // Phase 1: shared_secret = scan_key * tweak_point (predecomposed GLV)
     // ------------------------------------------------------------------
-    JacobianPoint shared_jac = scalar_mul_glv(tweak_pt, sk);
+    JacobianPoint shared_jac = scalar_mul_glv_predecomp(tweak_pt, scan_plan);
     AffinePoint shared_aff = jacobian_to_affine(shared_jac);
 
     // ------------------------------------------------------------------

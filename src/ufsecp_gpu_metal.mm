@@ -86,7 +86,7 @@ static mtl::ComputePipeline g_fused_lut_pipeline;
 struct UfsecpMetalBatchState {
     // Fused path: raw LE byte buffers
     mtl::MetalBuffer tweak_buf;
-    mtl::MetalBuffer scan_key_buf;
+    mtl::MetalBuffer scan_plan_buf;
     mtl::MetalBuffer out_x_buf;
     mtl::MetalBuffer out_y_buf;
     mtl::MetalBuffer midstate_buf;
@@ -205,7 +205,7 @@ static void EnsureGenLutBuilt() {
         return;
     }
 
-    // Step 1: Compute 16 base points
+    // Step 1: Compute GEN_LUT_SLICES base points
     auto bases_buf = g_runtime->alloc_buffer(GEN_LUT_SLICES * AFFINE_POINT_SIZE);
     {
         std::lock_guard<std::mutex> mlock(g_metal_mutex);
@@ -228,7 +228,7 @@ static void EnsureGenLutBuilt() {
     int n_entries = GEN_LUT_N;
     n_buf.write(&n_entries, 1);
 
-    // Step 3: Build chain + serial inversion (16 threadgroups x 1 thread)
+    // Step 3: Build chain + serial inversion (GEN_LUT_SLICES threadgroups x 1 thread)
     {
         std::lock_guard<std::mutex> mlock(g_metal_mutex);
         std::vector<mtl::MetalBuffer *> bufs = {
@@ -305,7 +305,6 @@ int UfsecpMetalDetect(int *num_gpus) {
 
 void *UfsecpMetalLaunchBatch(const uint8_t *scan_key, const uint8_t *tweak_data, uint32_t count, int device_id,
                              const void *precomp) {
-    (void)precomp; // Metal does its own on-device decomposition
     (void)device_id; // Metal runtime manages device selection
 
     if (!g_runtime || g_metal_device_count == 0)
@@ -318,14 +317,14 @@ void *UfsecpMetalLaunchBatch(const uint8_t *scan_key, const uint8_t *tweak_data,
     if (state->use_fused) {
         // Fused path: copy raw LE bytes directly into Metal buffers (no conversion)
         state->tweak_buf = g_runtime->alloc_buffer(count * 64);
-        state->scan_key_buf = g_runtime->alloc_buffer(32);
+        state->scan_plan_buf = g_runtime->alloc_buffer(264);
         state->out_x_buf = g_runtime->alloc_buffer(count * 32);
         state->out_y_buf = g_runtime->alloc_buffer(count * 32);
         state->midstate_buf = g_runtime->alloc_buffer(8 * sizeof(uint32_t));
         state->count_buf = g_runtime->alloc_buffer(sizeof(uint32_t));
 
         std::memcpy(state->tweak_buf.contents(), tweak_data, count * 64);
-        std::memcpy(state->scan_key_buf.contents(), scan_key, 32);
+        std::memcpy(state->scan_plan_buf.contents(), precomp, 264);
         std::memcpy(state->midstate_buf.contents(), g_bip352_midstate, 8 * sizeof(uint32_t));
         state->count_buf.write(&count, 1);
     } else {
@@ -359,7 +358,7 @@ int UfsecpMetalRunKernels(void *state_handle, uint8_t *out_x, uint8_t *out_y, ui
         if (g_lut_available) {
             std::lock_guard<std::mutex> lock(g_metal_mutex);
             std::vector<mtl::MetalBuffer *> bufs = {
-                &state->tweak_buf, &state->scan_key_buf,
+                &state->tweak_buf, &state->scan_plan_buf,
                 &state->out_x_buf, &state->out_y_buf,
                 &state->midstate_buf, &state->count_buf,
                 &g_gen_lut_buf
@@ -369,7 +368,7 @@ int UfsecpMetalRunKernels(void *state_handle, uint8_t *out_x, uint8_t *out_y, ui
         } else {
             std::lock_guard<std::mutex> lock(g_metal_mutex);
             std::vector<mtl::MetalBuffer *> bufs = {
-                &state->tweak_buf, &state->scan_key_buf,
+                &state->tweak_buf, &state->scan_plan_buf,
                 &state->out_x_buf, &state->out_y_buf,
                 &state->midstate_buf, &state->count_buf
             };
