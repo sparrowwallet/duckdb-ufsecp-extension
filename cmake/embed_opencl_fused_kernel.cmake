@@ -299,6 +299,239 @@ __kernel void gen_lut_convert_zinv_kernel(
     aff_table[offset + j].x = ax;
     aff_table[offset + j].y = ay;
 }
+
+// =============================================================================
+// Full pipeline: phases 1-6 on GPU with batch inversion
+// =============================================================================
+
+#define MAX_LABEL_KEYS 16
+
+typedef struct {
+    AffinePoint base;
+    AffinePoint labels[MAX_LABEL_KEYS];
+    uchar num_labels;
+    uchar pad[3];
+} BIP352SpendKeys;
+
+// Hillis-Steele parallel prefix multiply (inclusive, local memory)
+inline void ocl_block_prefix_mul(__local FieldElement* data, int n) {
+    int tid = get_local_id(0);
+    for (int offset = 1; offset < n; offset *= 2) {
+        FieldElement val;
+        if (tid >= offset && tid < n) {
+            FieldElement a = data[tid - offset], b = data[tid];
+            field_mul_impl(&val, &a, &b);
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (tid >= offset && tid < n)
+            data[tid] = val;
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+}
+
+// Hillis-Steele parallel suffix multiply (inclusive, local memory)
+inline void ocl_block_suffix_mul(__local FieldElement* data, int n) {
+    int tid = get_local_id(0);
+    for (int offset = 1; offset < n; offset *= 2) {
+        FieldElement val;
+        if (tid + offset < n) {
+            FieldElement a = data[tid + offset], b = data[tid];
+            field_mul_impl(&val, &a, &b);
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (tid + offset < n)
+            data[tid] = val;
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+}
+
+// Helper: in-block batch inversion using local memory prefix/suffix scans.
+// ocl_block_batch_invert: broadcasts total inverse via R[0] (not needed for recovery)
+inline void ocl_block_batch_invert(
+    FieldElement input, FieldElement* z_inv_out,
+    __local FieldElement* L, __local FieldElement* R, int valid_in_block)
+{
+    int tid = get_local_id(0);
+    L[tid] = input;
+    R[tid] = input;
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    ocl_block_prefix_mul(L, valid_in_block);
+    ocl_block_suffix_mul(R, valid_in_block);
+
+    // Thread 0 computes total inverse and broadcasts via R[0]
+    // (R[0] is not read by any thread in the recovery step — only R[tid+1] is used)
+    if (tid == 0 && valid_in_block > 0) {
+        FieldElement total_prod = L[valid_in_block - 1];
+        FieldElement inv_result;
+        field_inv_impl(&inv_result, &total_prod);
+        R[0] = inv_result;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    FieldElement total_inv = R[0];
+
+    FieldElement z_inv = total_inv;
+    if (tid > 0) {
+        FieldElement lprev = L[tid - 1];
+        field_mul_impl(&z_inv, &z_inv, &lprev);
+    }
+    if (tid < valid_in_block - 1) {
+        FieldElement rnext = R[tid + 1];
+        field_mul_impl(&z_inv, &z_inv, &rnext);
+    }
+
+    *z_inv_out = z_inv;
+    barrier(CLK_LOCAL_MEM_FENCE);
+}
+
+// Helper: extract upper 64 bits of affine x from Jacobian X and Z^{-1}.
+inline long ocl_extract_prefix(const FieldElement* jac_x, const FieldElement* z_inv) {
+    FieldElement z_inv2, ax;
+    field_sqr_impl(&z_inv2, z_inv);
+    field_mul_impl(&ax, jac_x, &z_inv2);
+
+    uchar x_bytes[32];
+    field_to_bytes_impl(&ax, x_bytes);
+    long pfx = 0;
+    for (int i = 0; i < 8; i++)
+        pfx = (pfx << 8) | (long)x_bytes[i];
+    return pfx;
+}
+
+// Pass 1: phases 1-4, add spend key, store candidate X/Z + output points
+__kernel void bip352_full_pass1(
+    __global const uchar *tweak_xy,
+    __constant const BIP352ScanKeyGlv *scan_plan,
+    __global const AffinePoint *gen_lut,
+    __constant const BIP352SpendKeys *spend,
+    __global FieldElement *cand_x,
+    __global FieldElement *cand_z,
+    __global JacobianPoint *output_pts,
+    const uint count)
+{
+    uint gid = get_global_id(0);
+    if (gid >= count) return;
+
+    __global const uchar *tweak = tweak_xy + gid * 64;
+    FieldElement fx, fy;
+    for (int i = 0; i < 4; i++) {
+        ulong lx = 0, ly = 0;
+        for (int j = 7; j >= 0; j--) {
+            lx = (lx << 8) | tweak[i * 8 + j];
+            ly = (ly << 8) | tweak[32 + i * 8 + j];
+        }
+        fx.limbs[i] = lx;
+        fy.limbs[i] = ly;
+    }
+    AffinePoint tweak_pt;
+    tweak_pt.x = fx;
+    tweak_pt.y = fy;
+
+    JacobianPoint shared_jac;
+    scalar_mul_glv_predecomp_impl(&shared_jac, &tweak_pt, scan_plan);
+
+    uchar ser[37];
+    bip352_shared_secret_input_impl(&shared_jac, ser);
+
+    uchar hash[32];
+    bip352_tagged_sha256_impl(ser, 37, hash);
+
+    Scalar hs;
+    scalar_from_bytes_impl(hash, &hs);
+    JacobianPoint output_point;
+    scalar_mul_gen_lut(&output_point, &hs, gen_lut);
+
+    // Store output point for label processing
+    output_pts[gid] = output_point;
+
+    // Add spend key
+    AffinePoint spend_base = spend->base;
+    JacobianPoint candidate;
+    point_add_mixed_impl(&candidate, &output_point, &spend_base);
+
+    cand_x[gid] = candidate.x;
+    cand_z[gid] = candidate.z;
+}
+
+// Fused batch inversion + prefix extraction + matching.
+// Base case: batch-invert candidate Z. Labels: batch-invert per label round.
+__kernel void bip352_batch_inv_match(
+    __global const FieldElement *cand_x,
+    __global const FieldElement *cand_z,
+    __global const JacobianPoint *output_pts,
+    __constant const BIP352SpendKeys *spend,
+    __global const long *output_prefixes,
+    __global const uint *output_offsets,
+    __global const uchar *output_lengths,
+    __global uchar *match_flags,
+    __local FieldElement *shared_mem,
+    const uint count)
+{
+    int tid = get_local_id(0);
+    int gid = get_global_id(0);
+    int valid = (gid < (int)count);
+
+    int valid_in_block = (int)count - (int)get_group_id(0) * (int)get_local_size(0);
+    if (valid_in_block > (int)get_local_size(0)) valid_in_block = (int)get_local_size(0);
+
+    __local FieldElement *L = shared_mem;
+    __local FieldElement *R = shared_mem + get_local_size(0);
+
+    uint off = 0;
+    uchar len = 0;
+    int found = 0;
+
+    if (valid) {
+        off = output_offsets[gid];
+        len = output_lengths[gid];
+    }
+
+    // Round 1: base spend key
+    {
+        FieldElement z_val;
+        if (valid) z_val = cand_z[gid];
+        else { z_val.limbs[0] = 1UL; z_val.limbs[1] = 0; z_val.limbs[2] = 0; z_val.limbs[3] = 0; }
+
+        FieldElement z_inv;
+        ocl_block_batch_invert(z_val, &z_inv, L, R, valid_in_block);
+
+        if (valid) {
+            FieldElement cx = cand_x[gid];
+            long pfx = ocl_extract_prefix(&cx, &z_inv);
+            for (uchar j = 0; j < len && !found; j++)
+                if (output_prefixes[off + j] == pfx) found = 1;
+        }
+    }
+
+    // Rounds 2+: label keys
+    for (uchar lbl = 0; lbl < spend->num_labels; lbl++) {
+        FieldElement label_z, label_x;
+        if (valid) {
+            JacobianPoint op = output_pts[gid];
+            AffinePoint label_key = spend->labels[lbl];
+            JacobianPoint label_cand;
+            point_add_mixed_impl(&label_cand, &op, &label_key);
+            label_x = label_cand.x;
+            label_z = label_cand.z;
+        } else {
+            label_z.limbs[0] = 1UL; label_z.limbs[1] = 0;
+            label_z.limbs[2] = 0; label_z.limbs[3] = 0;
+        }
+
+        FieldElement label_z_inv;
+        ocl_block_batch_invert(label_z, &label_z_inv, L, R, valid_in_block);
+
+        if (valid && !found) {
+            long label_pfx = ocl_extract_prefix(&label_x, &label_z_inv);
+            for (uchar j = 0; j < len && !found; j++)
+                if (output_prefixes[off + j] == label_pfx) found = 1;
+        }
+    }
+
+    if (valid)
+        match_flags[gid] = found ? 1 : 0;
+}
 ")
 
 # Write as C++ header with multiple string literals to stay under MSVC's 65535-byte limit.

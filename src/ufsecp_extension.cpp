@@ -28,6 +28,11 @@
 #ifdef UFSECP_CUDA_ENABLED
 extern "C" {
 int UfsecpCudaDetect(int *num_gpus);
+void UfsecpCudaSetSpendKey(const uint8_t *spend_xy, int num_labels, const uint8_t *label_keys_xy, int device_id);
+void *UfsecpCudaLaunchBatchFull(const uint8_t *tweak_data, const int64_t *output_prefixes, uint32_t total_outputs,
+                                const uint32_t *output_offsets, const uint8_t *output_lengths, uint32_t count,
+                                int device_id, const void *precomp);
+int UfsecpCudaRunKernelsFull(void *state_handle, uint8_t *match_flags, uint32_t count);
 void *UfsecpCudaLaunchBatch(const uint8_t *scan_key, const uint8_t *tweak_data, uint32_t count, int device_id,
                             const void *precomp);
 int UfsecpCudaRunKernels(void *state_handle, uint8_t *out_x, uint8_t *out_y, uint32_t count);
@@ -37,6 +42,11 @@ void UfsecpCudaFreeBatch(void *state_handle);
 #ifdef UFSECP_OPENCL_ENABLED
 extern "C" {
 int UfsecpOclDetect(int *num_gpus);
+void UfsecpOclSetSpendKey(const uint8_t *spend_xy, int num_labels, const uint8_t *label_keys_xy, int device_id);
+void *UfsecpOclLaunchBatchFull(const uint8_t *tweak_data, const int64_t *output_prefixes, uint32_t total_outputs,
+                               const uint32_t *output_offsets, const uint8_t *output_lengths, uint32_t count,
+                               int device_id, const void *precomp);
+int UfsecpOclRunKernelsFull(void *state_handle, uint8_t *match_flags, uint32_t count);
 void *UfsecpOclLaunchBatch(const uint8_t *scan_key, const uint8_t *tweak_data, uint32_t count, int device_id,
                            const void *precomp);
 int UfsecpOclRunKernels(void *state_handle, uint8_t *out_x, uint8_t *out_y, uint32_t count);
@@ -73,7 +83,13 @@ static int g_num_gpus = 0;
 static bool g_gpu_detected = false;
 static std::mutex g_gpu_init_mutex;
 
-// Function pointers for the active GPU backend
+// Function pointers for the active GPU backend — full pipeline (phases 1-6)
+static void (*g_gpu_set_spend)(const uint8_t *, int, const uint8_t *, int) = nullptr;
+static void *(*g_gpu_launch_full)(const uint8_t *, const int64_t *, uint32_t, const uint32_t *, const uint8_t *,
+                                  uint32_t, int, const void *) = nullptr;
+static int (*g_gpu_run_full)(void *, uint8_t *, uint32_t) = nullptr;
+
+// Function pointers for the active GPU backend — legacy (phases 1-4, fallback)
 static void *(*g_gpu_launch)(const uint8_t *, const uint8_t *, uint32_t, int, const void *) = nullptr;
 static int (*g_gpu_run)(void *, uint8_t *, uint8_t *, uint32_t) = nullptr;
 static void (*g_gpu_free)(void *) = nullptr;
@@ -93,6 +109,9 @@ static void EnsureGpuDetected() {
 		if (cuda_gpus > 0) {
 			g_num_gpus = cuda_gpus;
 			g_gpu_backend = GpuBackend::CUDA;
+			g_gpu_set_spend = UfsecpCudaSetSpendKey;
+			g_gpu_launch_full = UfsecpCudaLaunchBatchFull;
+			g_gpu_run_full = UfsecpCudaRunKernelsFull;
 			g_gpu_launch = UfsecpCudaLaunchBatch;
 			g_gpu_run = UfsecpCudaRunKernels;
 			g_gpu_free = UfsecpCudaFreeBatch;
@@ -108,6 +127,9 @@ static void EnsureGpuDetected() {
 		if (ocl_gpus > 0) {
 			g_num_gpus = ocl_gpus;
 			g_gpu_backend = GpuBackend::OPENCL;
+			g_gpu_set_spend = UfsecpOclSetSpendKey;
+			g_gpu_launch_full = UfsecpOclLaunchBatchFull;
+			g_gpu_run_full = UfsecpOclRunKernelsFull;
 			g_gpu_launch = UfsecpOclLaunchBatch;
 			g_gpu_run = UfsecpOclRunKernels;
 			g_gpu_free = UfsecpOclFreeBatch;
@@ -260,6 +282,9 @@ struct UfsecpScanState : public GlobalTableFunctionState {
 
 	// Only one thread returns output to avoid batch index conflicts
 	std::atomic<bool> output_thread_claimed;
+
+	// GPU spend key uploaded flag
+	std::atomic<bool> spend_key_uploaded{false};
 };
 
 // ============================================================================
@@ -482,17 +507,65 @@ static bool ShouldProcessBatch(const UfsecpScanLocalState &local_state, const Uf
 }
 
 // ============================================================================
-// ProcessBatchGpu — GPU-accelerated BIP-352 scanning (phases 1-4 on GPU)
+// ProcessBatchGpu — GPU-accelerated BIP-352 scanning
 // ============================================================================
+// Full pipeline (phases 1-6 on GPU): returns match flags only.
+// Fallback (phases 1-4 on GPU): returns affine (x,y) for CPU phases 5-6.
 
 #ifdef UFSECP_GPU_ENABLED
+
+// Build scan key GLV plan from KPlan (shared by both paths)
+struct ScanGlvPlan {
+	char wnaf1[130];
+	char wnaf2[130];
+	uint8_t k1_neg;
+	uint8_t flip_phi;
+	uint8_t pad0;
+	uint8_t pad1;
+};
+
+static ScanGlvPlan BuildScanGlvPlan(const KPlan &plan) {
+	ScanGlvPlan glv = {};
+	size_t n1 = std::min(plan.wnaf1.size(), size_t(130));
+	size_t n2 = std::min(plan.wnaf2.size(), size_t(130));
+	for (size_t i = 0; i < n1; i++)
+		glv.wnaf1[i] = static_cast<char>(plan.wnaf1[i]);
+	for (size_t i = 0; i < n2; i++)
+		glv.wnaf2[i] = static_cast<char>(plan.wnaf2[i]);
+	glv.k1_neg = plan.neg1 ? 1 : 0;
+	glv.flip_phi = (plan.neg1 != plan.neg2) ? 1 : 0;
+	return glv;
+}
+
 static void ProcessBatchGpu(UfsecpScanLocalState &local_state, const UfsecpScanBindData &bind_data,
                             UfsecpScanState &global_state) {
 	idx_t N = local_state.accumulated_txids.size();
 	if (N == 0)
 		return;
 
-	// === GPU Phases 1-4: fused kernel ===
+	// Upload spend key to GPU once per query (thread-safe: worst case is redundant upload)
+	if (g_gpu_set_spend && !global_state.spend_key_uploaded) {
+		const uint8_t *sp = reinterpret_cast<const uint8_t *>(bind_data.spend_public_key_data.data());
+
+		// Build label keys as contiguous LE bytes
+		std::vector<uint8_t> label_buf;
+		for (auto &lsk : bind_data.labelled_spend_keys) {
+			uint8_t lk[64];
+			// FieldElement to LE bytes
+			for (int i = 0; i < 4; i++) {
+				uint64_t xv = lsk.x.limbs()[i], yv = lsk.y.limbs()[i];
+				for (int j = 0; j < 8; j++) {
+					lk[i * 8 + j] = (uint8_t)(xv >> (j * 8));
+					lk[32 + i * 8 + j] = (uint8_t)(yv >> (j * 8));
+				}
+			}
+			label_buf.insert(label_buf.end(), lk, lk + 64);
+		}
+
+		g_gpu_set_spend(sp, (int)bind_data.labelled_spend_keys.size(),
+		                label_buf.empty() ? nullptr : label_buf.data(), 0);
+		global_state.spend_key_uploaded = true;
+	}
 
 	// Marshal tweak keys into contiguous buffer (N × 64 bytes, already LE)
 	std::vector<uint8_t> tweak_buf(N * 64);
@@ -500,59 +573,81 @@ static void ProcessBatchGpu(UfsecpScanLocalState &local_state, const UfsecpScanB
 		std::memcpy(tweak_buf.data() + i * 64, local_state.accumulated_tweak_keys[i].data(), 64);
 	}
 
-	// Build precomputed scan key plan for GPU (wNAF + GLV decomposition)
-	struct {
-		char wnaf1[130];
-		char wnaf2[130];
-		uint8_t k1_neg;
-		uint8_t flip_phi;
-		uint8_t pad0;
-		uint8_t pad1;
-	} scan_glv = {};
-	{
-		const auto &plan = bind_data.kplan;
-		size_t n1 = std::min(plan.wnaf1.size(), size_t(130));
-		size_t n2 = std::min(plan.wnaf2.size(), size_t(130));
-		for (size_t i = 0; i < n1; i++)
-			scan_glv.wnaf1[i] = static_cast<char>(plan.wnaf1[i]);
-		for (size_t i = 0; i < n2; i++)
-			scan_glv.wnaf2[i] = static_cast<char>(plan.wnaf2[i]);
-		scan_glv.k1_neg = plan.neg1 ? 1 : 0;
-		scan_glv.flip_phi = (plan.neg1 != plan.neg2) ? 1 : 0;
+	ScanGlvPlan scan_glv = BuildScanGlvPlan(bind_data.kplan);
+
+	// ====================================================================
+	// Try full pipeline (phases 1-6 on GPU)
+	// ====================================================================
+	if (g_gpu_launch_full) {
+		// Marshal output offsets and lengths
+		std::vector<uint32_t> output_offsets(N);
+		std::vector<uint8_t> output_lengths(N);
+		for (idx_t i = 0; i < N; i++) {
+			output_offsets[i] = static_cast<uint32_t>(local_state.accumulated_output_offsets[i]);
+			output_lengths[i] = static_cast<uint8_t>(local_state.accumulated_output_lengths[i]);
+		}
+		uint32_t total_outputs = static_cast<uint32_t>(local_state.accumulated_outputs.size());
+
+		void *gpu_state = g_gpu_launch_full(tweak_buf.data(), local_state.accumulated_outputs.data(), total_outputs,
+		                                    output_offsets.data(), output_lengths.data(), static_cast<uint32_t>(N),
+		                                    local_state.assigned_gpu, &scan_glv);
+
+		if (gpu_state) {
+			std::vector<uint8_t> match_flags(N);
+			int result = g_gpu_run_full(gpu_state, match_flags.data(), static_cast<uint32_t>(N));
+			g_gpu_free(gpu_state);
+
+			if (result == 0) {
+				// Write matches to global output
+				global_state.output_lock->lock();
+				for (idx_t i = 0; i < N; i++) {
+					if (match_flags[i]) {
+						global_state.output_txids.push_back(local_state.accumulated_txids[i]);
+						global_state.output_heights.push_back(local_state.accumulated_heights[i]);
+						global_state.output_tweak_keys.push_back(local_state.accumulated_tweak_keys[i]);
+					}
+				}
+				global_state.output_lock->unlock();
+
+				local_state.accumulated_txids.clear();
+				local_state.accumulated_heights.clear();
+				local_state.accumulated_tweak_keys.clear();
+				local_state.accumulated_outputs.clear();
+				local_state.accumulated_output_offsets.clear();
+				local_state.accumulated_output_lengths.clear();
+				return;
+			}
+			// Kernel failed — fall through to legacy path
+		}
 	}
 
-	// Launch GPU batch
+	// ====================================================================
+	// Legacy path: phases 1-4 on GPU, phases 5-6 on CPU
+	// ====================================================================
 	const uint8_t *scan_key = reinterpret_cast<const uint8_t *>(bind_data.scan_private_key_data.data());
 
 	void *gpu_state =
 	    g_gpu_launch(scan_key, tweak_buf.data(), static_cast<uint32_t>(N), local_state.assigned_gpu, &scan_glv);
 
 	if (!gpu_state) {
-		// GPU launch failed — fall back to CPU
 		ProcessBatch(local_state, bind_data, global_state);
 		return;
 	}
 
-	// Allocate host output buffers for GPU results
 	std::vector<uint8_t> out_x_bytes(N * 32);
 	std::vector<uint8_t> out_y_bytes(N * 32);
 
 	int result = g_gpu_run(gpu_state, out_x_bytes.data(), out_y_bytes.data(), static_cast<uint32_t>(N));
-
 	g_gpu_free(gpu_state);
 
 	if (result != 0) {
-		// Kernel failed — fall back to CPU
 		ProcessBatch(local_state, bind_data, global_state);
 		return;
 	}
 
-	// === CPU Phases 5-6: batch affine add + match ===
-
-	// Convert GPU output bytes to AffinePointCompact for batch_add_affine_x
+	// CPU Phases 5-6
 	std::vector<AffinePointCompact> offsets(N);
 	for (idx_t i = 0; i < N; i++) {
-		// GPU output is 32 LE bytes per coordinate → FieldElement::from_bytes expects BE
 		std::array<uint8_t, 32> x_be, y_be;
 		for (int j = 0; j < 32; j++) {
 			x_be[j] = out_x_bytes[i * 32 + 31 - j];
@@ -562,12 +657,10 @@ static void ProcessBatchGpu(UfsecpScanLocalState &local_state, const UfsecpScanB
 		offsets[i].y = FieldElement::from_bytes(y_be);
 	}
 
-	// Phase 5: Batch addition — base case (spend_key + output_point[i])
 	std::vector<FieldElement> final_x(N);
 	secp256k1::fast::batch_add_affine_x(bind_data.spend_x, bind_data.spend_y, offsets.data(), final_x.data(), N,
 	                                    local_state.scratch);
 
-	// Phase 6: Match checking — base case
 	std::vector<bool> matched(N, false);
 	for (idx_t i = 0; i < N; i++) {
 		int64_t upper64 = ExtractUpper64(final_x[i]);
@@ -581,7 +674,6 @@ static void ProcessBatchGpu(UfsecpScanLocalState &local_state, const UfsecpScanB
 		}
 	}
 
-	// Phase 6b: Label cases
 	for (idx_t L = 0; L < bind_data.labelled_spend_keys.size(); L++) {
 		std::vector<FieldElement> labelled_x(N);
 		secp256k1::fast::batch_add_affine_x(bind_data.labelled_spend_keys[L].x, bind_data.labelled_spend_keys[L].y,
@@ -602,7 +694,6 @@ static void ProcessBatchGpu(UfsecpScanLocalState &local_state, const UfsecpScanB
 		}
 	}
 
-	// Write matches to global output
 	global_state.output_lock->lock();
 	for (idx_t i = 0; i < N; i++) {
 		if (matched[i]) {
@@ -613,7 +704,6 @@ static void ProcessBatchGpu(UfsecpScanLocalState &local_state, const UfsecpScanB
 	}
 	global_state.output_lock->unlock();
 
-	// Clear accumulated input after processing
 	local_state.accumulated_txids.clear();
 	local_state.accumulated_heights.clear();
 	local_state.accumulated_tweak_keys.clear();
