@@ -32,7 +32,7 @@ jobs:
             install_cuda: false
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
           submodules: 'recursive'
@@ -63,12 +63,6 @@ jobs:
             choco install ninja
           fi
 
-      - name: Setup vcpkg
-        if: ${{ startsWith(matrix.runner, 'windows') }}
-        uses: lukka/run-vcpkg@v11.1
-        with:
-          vcpkgGitCommitId: 'ce613c41372b23b1f51333815feb3edd87ef8a8b'
-
       - name: Build extension (Windows)
         if: ${{ startsWith(matrix.runner, 'windows') }}
         shell: cmd
@@ -87,7 +81,7 @@ jobs:
           GEN=ninja make release
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ufsecp-gpu-${{ matrix.runner }}
           path: |
