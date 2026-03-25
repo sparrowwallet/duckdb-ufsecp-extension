@@ -57,11 +57,12 @@ static bool g_tag_computed = false;
 static uint32_t g_bip352_midstate[8];
 
 // ============================================================================
-// Generator LUT state (64 MB precomputed table for k*G)
+// Generator LUT state (w=16: 16 slices x 65536 entries = 64 MB)
 // ============================================================================
 
-static constexpr int GEN_LUT_N = 65536;
-static constexpr int GEN_LUT_SLICES = 16;
+static constexpr int GEN_LUT_WBITS = 16;
+static constexpr int GEN_LUT_N = (1 << GEN_LUT_WBITS);       // 65536
+static constexpr int GEN_LUT_SLICES = (256 + GEN_LUT_WBITS - 1) / GEN_LUT_WBITS; // 16
 static constexpr int GEN_LUT_TOTAL = GEN_LUT_SLICES * GEN_LUT_N;
 static constexpr int AFFINE_POINT_SIZE = 64;
 static constexpr int FIELD_ELEMENT_SIZE = 32;

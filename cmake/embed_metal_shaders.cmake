@@ -32,7 +32,6 @@ foreach(FILE ${SHADER_FILES})
     string(APPEND COMBINED "${CONTENT}\n")
 endforeach()
 
-# Keep the w=16 LUT defines from secp256k1_extended.h as-is (scalar_mul_generator_lut uses them)
 
 # Append inline kernel definitions (matching secp256k1_kernels.metal signatures)
 string(APPEND COMBINED "
@@ -143,19 +142,53 @@ inline JacobianPoint scalar_mul_glv_predecomp(thread const AffinePoint &base,
 }
 
 // =============================================================================
-// Generator LUT constants (w=16: 16 slices x 65536 entries = 64 MB)
+// Generator LUT (w=16: 16 slices x 65536 entries = 64 MB)
 // =============================================================================
 
-// scalar_mul_generator_lut is defined in secp256k1_extended.h (w=16, included above)
+constant int GEN_LUT_WBITS = 16;
+constant int GEN_LUT_N = (1 << 16);    // 65536
+constant int GEN_LUT_SLICES_COUNT = 16; // ceil(256/16)
 
-constant int GEN_LUT_N = GEN_LUT_ENTRIES;     // 65536
-constant int GEN_LUT_SLICES_COUNT = GEN_LUT_WINDOWS; // 16
+inline JacobianPoint scalar_mul_generator_lut(
+    thread const Scalar256 &k,
+    device const AffinePoint *lut)
+{
+    // Reconstruct 4 x uint64 from 8 x uint32 for window extraction
+    // (matches CUDA/OpenCL 64-bit limb layout)
+    ulong limbs64[4];
+    for (int i = 0; i < 4; i++)
+        limbs64[i] = ulong(k.limbs[i * 2]) | (ulong(k.limbs[i * 2 + 1]) << 32);
+
+    JacobianPoint r = point_at_infinity();
+    const uint MASK = (1u << GEN_LUT_WBITS) - 1;
+    for (int win = 0; win < GEN_LUT_SLICES_COUNT; win++) {
+        int bitpos = win * GEN_LUT_WBITS;
+        int limb = bitpos >> 6;
+        int shift = bitpos & 63;
+        uint idx = uint((limbs64[limb] >> shift) & MASK);
+        if (shift + GEN_LUT_WBITS > 64 && limb < 3)
+            idx |= uint((limbs64[limb + 1] << (64 - shift)) & MASK);
+        if (idx != 0) {
+            AffinePoint pt = lut[win * GEN_LUT_N + idx];
+            if (r.infinity != 0) {
+                r.x = pt.x; r.y = pt.y;
+                r.z = field_one(); r.infinity = 0;
+            } else {
+                r = jacobian_add_mixed(r, pt);
+            }
+        }
+    }
+    if (r.infinity != 0) {
+        r.x = field_zero(); r.y = field_one(); r.z = field_zero();
+    }
+    return r;
+}
 
 // =============================================================================
 // Generator LUT build kernels
 // =============================================================================
 
-// Kernel 1: Compute base points B_i = 2^(GEN_LUT_WINDOW_BITS*i) * G for i=0..15
+// Kernel 1: Compute base points B_i = 2^(GEN_LUT_WBITS*i) * G for i=0..GEN_LUT_SLICES_COUNT-1
 kernel void compute_lut_base_points(
     device AffinePoint *bases    [[buffer(0)]],
     uint tid [[thread_position_in_grid]])
@@ -169,7 +202,7 @@ kernel void compute_lut_base_points(
     p.x = g.x; p.y = g.y; p.z = field_one(); p.infinity = 0;
 
     for (int i = 1; i < GEN_LUT_SLICES_COUNT; i++) {
-        for (int d = 0; d < GEN_LUT_WINDOW_BITS; d++)
+        for (int d = 0; d < GEN_LUT_WBITS; d++)
             p = jacobian_double(p);
 
         AffinePoint aff = jacobian_to_affine(p);
