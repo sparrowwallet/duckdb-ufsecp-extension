@@ -92,7 +92,7 @@ __device__ inline void scalar_mul_predecomp(
 
     #pragma unroll 1
     for (int i = 129; i >= 0; --i) {
-        if (!r->infinity) jacobian_double(r, r);
+        if (!r->infinity) jacobian_double_unchecked(r, r);
 
         int8_t d1 = g_scan_wnaf.wnaf1[i];
         if (d1 != 0) {
@@ -103,7 +103,7 @@ __device__ inline void scalar_mul_predecomp(
                 r->x = pt.x; r->y = pt.y;
                 field_set_one(&r->z); r->infinity = false;
             } else {
-                jacobian_add_mixed(r, &pt, r);
+                jacobian_add_mixed_unchecked(r, &pt, r);
             }
         }
 
@@ -116,7 +116,7 @@ __device__ inline void scalar_mul_predecomp(
                 r->x = pt.x; r->y = pt.y;
                 field_set_one(&r->z); r->infinity = false;
             } else {
-                jacobian_add_mixed(r, &pt, r);
+                jacobian_add_mixed_unchecked(r, &pt, r);
             }
         }
     }
@@ -170,7 +170,7 @@ __device__ inline void scalar_mul_gen_lut(
                 r->x = pt->x; r->y = pt->y;
                 field_set_one(&r->z); r->infinity = false;
             } else {
-                jacobian_add_mixed(r, pt, r);
+                jacobian_add_mixed_unchecked(r, pt, r);
             }
         }
     }
@@ -454,7 +454,7 @@ __global__ void BIP352FullPass1(
 
     // Phase 5: candidate = output_point + spend_key
     JacobianPoint candidate;
-    jacobian_add_mixed(&output_point, &g_spend.base, &candidate);
+    jacobian_add_mixed_unchecked(&output_point, &g_spend.base, &candidate);
 
     cand_x[idx] = candidate.x;
     cand_z[idx] = candidate.z;
@@ -570,7 +570,7 @@ __global__ __launch_bounds__(256, 4) void BIP352BatchInvMatchKernel(
             FieldElement label_z, label_x;
             if (valid) {
                 JacobianPoint label_cand;
-                jacobian_add_mixed(&output_pts[idx], &g_spend.labels[lbl], &label_cand);
+                jacobian_add_mixed_unchecked(&output_pts[idx], &g_spend.labels[lbl], &label_cand);
                 label_x = label_cand.x;
                 label_z = label_cand.z;
             } else {
