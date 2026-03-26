@@ -8,5 +8,5 @@
 	branch = main
 [submodule "UltrafastSecp256k1"]
 	path = UltrafastSecp256k1
-	url = https://github.com/shrec/UltrafastSecp256k1.git
+	url = https://github.com/sparrowwallet/UltrafastSecp256k1.git
 	branch = main
