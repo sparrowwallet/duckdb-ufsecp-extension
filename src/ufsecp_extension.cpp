@@ -1010,6 +1010,16 @@ static OperatorFinalizeResultType UfsecpScanFinalFunction(ExecutionContext &cont
 // ============================================================================
 
 static void LoadInternal(ExtensionLoader &loader) {
+	// Use w=12 precompute table (~5 MB) instead of default w=18 (~244 MB).
+	// Smaller table avoids stack overflow during build on Windows (1 MB default thread stack)
+	// and is fast enough for the CPU fallback path.
+	{
+		secp256k1::fast::FixedBaseConfig cfg {};
+		cfg.window_bits = 12;
+		cfg.thread_count = 1;
+		secp256k1::fast::configure_fixed_base(cfg);
+	}
+
 	TableFunction func("ufsecp_scan",
 	                   {LogicalType::TABLE, LogicalType::BLOB, LogicalType::BLOB, LogicalType::LIST(LogicalType::BLOB)},
 	                   nullptr, UfsecpScanBind, UfsecpScanInit, UfsecpScanLocalInit);
@@ -1026,7 +1036,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 		                                  auto path_str = path_vector.GetValue(0).ToString();
 		                                  // Set the full cache file path explicitly to bypass get_default_cache_path(),
 		                                  // which only returns cache_dir paths for files that already exist.
-		                                  std::string cache_path = path_str + "/cache_w18.bin";
+		                                  std::string cache_path = path_str + "/cache_w12.bin";
 #ifdef _WIN32
 		                                  _putenv_s("SECP256K1_CACHE_PATH", cache_path.c_str());
 #else
@@ -1036,7 +1046,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 		                                  // the tables. ensure_fixed_base_ready() is needed because the GPU scan
 		                                  // path bypasses Point::generator().scalar_mul() and would never trigger
 		                                  // the lazy build.
-		                                  secp256k1::fast::configure_fixed_base(secp256k1::fast::FixedBaseConfig {});
+		                                  secp256k1::fast::FixedBaseConfig cfg {};
+		                                  cfg.window_bits = 12;
+		                                  cfg.thread_count = 1;
+		                                  secp256k1::fast::configure_fixed_base(cfg);
 		                                  secp256k1::fast::ensure_fixed_base_ready();
 		                                  result.SetValue(0, Value(path_str));
 		                                  result.SetVectorType(VectorType::CONSTANT_VECTOR);
