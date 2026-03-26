@@ -108,6 +108,20 @@ endif()
 
 set(UFSECP_REFRESH_SOURCE_GRAPH OFF CACHE BOOL "" FORCE)
 
+# Workaround for upstream issue #192: stray closing brace in secp256k1.cuh
+# prematurely closes namespace cuda, breaking the 64-bit limb build.
+# Remove when upstream fixes this.
+set(_CUH_FILE "${CMAKE_CURRENT_SOURCE_DIR}/UltrafastSecp256k1/cuda/include/secp256k1.cuh")
+if(EXISTS "${_CUH_FILE}")
+    file(READ "${_CUH_FILE}" _CUH_CONTENT)
+    string(FIND "${_CUH_CONTENT}" "    return lo;\n}\n}\n\n// Forward decls" _STRAY_BRACE_POS)
+    if(NOT _STRAY_BRACE_POS EQUAL -1)
+        string(REPLACE "    return lo;\n}\n}\n\n// Forward decls" "    return lo;\n}\n\n// Forward decls" _CUH_CONTENT "${_CUH_CONTENT}")
+        file(WRITE "${_CUH_FILE}" "${_CUH_CONTENT}")
+        message(STATUS "ufsecp: patched stray brace in secp256k1.cuh (upstream #192)")
+    endif()
+endif()
+
 add_subdirectory(UltrafastSecp256k1)
 
 include_directories(src/include)
