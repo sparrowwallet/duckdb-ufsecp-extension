@@ -108,13 +108,6 @@ endif()
 
 set(UFSECP_REFRESH_SOURCE_GRAPH OFF CACHE BOOL "" FORCE)
 
-# Disable 5x52 field representation on Windows: the deep call chains in the
-# GLV+Shamir 5x52 path overflow DuckDB worker thread stacks (1 MB on Windows).
-# The 4x64 path has smaller stack frames and works within the limit.
-if(WIN32)
-    add_compile_definitions(SECP256K1_FAST_52BIT=0)
-endif()
-
 add_subdirectory(UltrafastSecp256k1 EXCLUDE_FROM_ALL)
 
 include_directories(src/include)
