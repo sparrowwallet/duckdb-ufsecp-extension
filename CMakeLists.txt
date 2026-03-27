@@ -115,7 +115,7 @@ if(WIN32)
     add_compile_definitions(SECP256K1_FAST_52BIT=0)
 endif()
 
-add_subdirectory(UltrafastSecp256k1)
+add_subdirectory(UltrafastSecp256k1 EXCLUDE_FROM_ALL)
 
 include_directories(src/include)
 include_directories(UltrafastSecp256k1/cpu/include)
