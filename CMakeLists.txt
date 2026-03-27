@@ -108,6 +108,15 @@ endif()
 
 set(UFSECP_REFRESH_SOURCE_GRAPH OFF CACHE BOOL "" FORCE)
 
+# Disable 5x52 field representation on Windows: the deep call chains in the
+# GLV+Shamir 5x52 path overflow DuckDB worker thread stacks (1 MB on Windows).
+# The library auto-enables 52-bit when __SIZEOF_INT128__ is present (MinGW/Clang)
+# and uses `#if defined(SECP256K1_FAST_52BIT)` guards, so defining it to 0 does
+# not work. Instead, suppress __SIZEOF_INT128__ to prevent auto-detection.
+if(WIN32)
+    add_compile_options(-U__SIZEOF_INT128__)
+endif()
+
 add_subdirectory(UltrafastSecp256k1 EXCLUDE_FROM_ALL)
 
 include_directories(src/include)
