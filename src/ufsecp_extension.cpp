@@ -23,6 +23,21 @@
 #include <cstring>
 #include <mutex>
 #include <atomic>
+#include <unordered_map>
+#include <memory>
+
+// ============================================================================
+// Progress registry — side-channel progress reporting for ufsecp_progress()
+// ============================================================================
+
+struct ScanProgress {
+	std::atomic<uint64_t> rows_received {0};
+	std::atomic<uint64_t> rows_processed {0};
+	std::atomic<bool> complete {false};
+};
+
+static std::mutex g_progress_mutex;
+static std::unordered_map<std::string, std::shared_ptr<ScanProgress>> g_progress_map;
 
 // Conditional GPU support — extern "C" declarations for each backend
 #ifdef UFSECP_CUDA_ENABLED
@@ -210,6 +225,12 @@ static int64_t ExtractUpper64(const FieldElement &fe) {
 struct UfsecpScanBindData : public TableFunctionData {
 	UfsecpScanBindData() : batch_size(300000) {
 	}
+	~UfsecpScanBindData() {
+		if (progress) {
+			std::lock_guard<std::mutex> lock(g_progress_mutex);
+			g_progress_map.erase(scan_private_key_data);
+		}
+	}
 
 	static constexpr idx_t TWEAK_KEY_SIZE = 64; // 64 bytes: uncompressed EC point (32-byte x || 32-byte y)
 	static constexpr idx_t SCALAR_SIZE = 32;    // 32 bytes: scalar for EC multiplication
@@ -238,6 +259,9 @@ struct UfsecpScanBindData : public TableFunctionData {
 	// Backend selection: "cpu", "gpu", or "auto" (default)
 	std::string backend = "auto";
 	bool use_gpu = false; // resolved at bind time from backend + GPU detection
+
+	// Progress tracking (shared with g_progress_map for side-channel polling)
+	std::shared_ptr<ScanProgress> progress;
 };
 
 // ============================================================================
@@ -851,6 +875,13 @@ static unique_ptr<FunctionData> UfsecpScanBind(ClientContext &context, TableFunc
 	bind_data->spend_public_key_data = std::string(spend_public_key.GetData(), spend_public_key.GetSize());
 	bind_data->label_keys_data = std::move(label_keys);
 
+	// Register progress entry for side-channel polling via ufsecp_progress()
+	bind_data->progress = std::make_shared<ScanProgress>();
+	{
+		std::lock_guard<std::mutex> lock(g_progress_mutex);
+		g_progress_map[bind_data->scan_private_key_data] = bind_data->progress;
+	}
+
 	// Precompute KPlan from scan_private_key (LE wire → Scalar → KPlan)
 	const uint8_t *sk_data = reinterpret_cast<const uint8_t *>(bind_data->scan_private_key_data.data());
 	Scalar scan_scalar = ScalarFromLE(sk_data);
@@ -920,8 +951,10 @@ static OperatorResultType UfsecpScanFunction(ExecutionContext &context, TableFun
 	auto &local_state = data_p.local_state->Cast<UfsecpScanLocalState>();
 
 	if (input.size() > 0) {
+		bind_data.progress->rows_received += input.size();
 		AccumulateInput(local_state, input);
 		if (ShouldProcessBatch(local_state, bind_data)) {
+			idx_t batch_count = local_state.accumulated_txids.size();
 #ifdef UFSECP_GPU_ENABLED
 			if (bind_data.use_gpu) {
 				ProcessBatchGpu(local_state, bind_data, global_state);
@@ -931,6 +964,7 @@ static OperatorResultType UfsecpScanFunction(ExecutionContext &context, TableFun
 #else
 			ProcessBatch(local_state, bind_data, global_state);
 #endif
+			bind_data.progress->rows_processed += batch_count;
 		}
 	}
 
@@ -949,6 +983,7 @@ static OperatorFinalizeResultType UfsecpScanFinalFunction(ExecutionContext &cont
 
 	// Process any remaining accumulated data from this thread
 	if (!local_state.finalized && !local_state.accumulated_txids.empty()) {
+		idx_t batch_count = local_state.accumulated_txids.size();
 #ifdef UFSECP_GPU_ENABLED
 		if (bind_data.use_gpu) {
 			ProcessBatchGpu(local_state, bind_data, state);
@@ -958,6 +993,7 @@ static OperatorFinalizeResultType UfsecpScanFinalFunction(ExecutionContext &cont
 #else
 		ProcessBatch(local_state, bind_data, state);
 #endif
+		bind_data.progress->rows_processed += batch_count;
 	}
 
 	// Decrement thread counter only once per thread
@@ -1010,6 +1046,7 @@ static OperatorFinalizeResultType UfsecpScanFinalFunction(ExecutionContext &cont
 		}
 	}
 
+	bind_data.progress->complete = true;
 	return OperatorFinalizeResultType::FINISHED;
 }
 
@@ -1088,6 +1125,42 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    });
 	backend_func.stability = FunctionStability::CONSISTENT;
 	loader.RegisterFunction(backend_func);
+
+	// ufsecp_progress(scan_key) — returns scan progress percentage (0-100), or -1 if no scan active
+	ScalarFunction progress_func("ufsecp_progress", {LogicalType::BLOB}, LogicalType::DOUBLE,
+	                             [](DataChunk &args, ExpressionState &state, Vector &result) {
+		                             auto &key_vector = args.data[0];
+		                             auto key_val = key_vector.GetValue(0);
+		                             string_t key = StringValue::Get(key_val);
+		                             std::string scan_key(key.GetData(), key.GetSize());
+
+		                             double pct = -1.0;
+		                             {
+			                             std::lock_guard<std::mutex> lock(g_progress_mutex);
+			                             auto it = g_progress_map.find(scan_key);
+			                             if (it != g_progress_map.end()) {
+				                             auto &sp = it->second;
+				                             if (sp->complete) {
+					                             pct = 100.0;
+				                             } else {
+					                             uint64_t received = sp->rows_received.load();
+					                             uint64_t processed = sp->rows_processed.load();
+					                             if (received > 0) {
+						                             pct = static_cast<double>(processed) /
+						                                   static_cast<double>(received) * 100.0;
+						                             if (pct > 100.0)
+							                             pct = 100.0;
+					                             } else {
+						                             pct = 0.0;
+					                             }
+				                             }
+			                             }
+		                             }
+		                             result.SetValue(0, Value::DOUBLE(pct));
+		                             result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	                             });
+	progress_func.stability = FunctionStability::VOLATILE;
+	loader.RegisterFunction(progress_func);
 }
 
 void UfsecpExtension::Load(ExtensionLoader &loader) {
