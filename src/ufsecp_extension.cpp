@@ -570,8 +570,10 @@ static void ProcessBatchGpu(UfsecpScanLocalState &local_state, const UfsecpScanB
 			label_buf.insert(label_buf.end(), lk, lk + 64);
 		}
 
-		g_gpu_set_spend(sp, (int)bind_data.labelled_spend_keys.size(), label_buf.empty() ? nullptr : label_buf.data(),
-		                0);
+		for (int gpu = 0; gpu < g_num_gpus; gpu++) {
+			g_gpu_set_spend(sp, (int)bind_data.labelled_spend_keys.size(),
+			                label_buf.empty() ? nullptr : label_buf.data(), gpu);
+		}
 		global_state.spend_key_uploaded = true;
 	}
 
@@ -625,8 +627,12 @@ static void ProcessBatchGpu(UfsecpScanLocalState &local_state, const UfsecpScanB
 				local_state.accumulated_output_lengths.clear();
 				return;
 			}
-			// Kernel failed — fall through to legacy path
+			fprintf(stderr, "[GPU] Full pipeline kernel failed (result=%d), falling back to legacy\n", result);
+		} else {
+			fprintf(stderr, "[GPU] Full pipeline launch returned null, falling back to legacy\n");
 		}
+	} else {
+		fprintf(stderr, "[GPU] g_gpu_launch_full is null, falling back to legacy\n");
 	}
 
 	// ====================================================================
@@ -638,6 +644,7 @@ static void ProcessBatchGpu(UfsecpScanLocalState &local_state, const UfsecpScanB
 	    g_gpu_launch(scan_key, tweak_buf.data(), static_cast<uint32_t>(N), local_state.assigned_gpu, &scan_glv);
 
 	if (!gpu_state) {
+		fprintf(stderr, "[GPU] Legacy launch returned null, falling back to CPU\n");
 		ProcessBatch(local_state, bind_data, global_state);
 		return;
 	}
@@ -649,6 +656,7 @@ static void ProcessBatchGpu(UfsecpScanLocalState &local_state, const UfsecpScanB
 	g_gpu_free(gpu_state);
 
 	if (result != 0) {
+		fprintf(stderr, "[GPU] Legacy kernel failed (result=%d), falling back to CPU\n", result);
 		ProcessBatch(local_state, bind_data, global_state);
 		return;
 	}

@@ -140,8 +140,9 @@ static constexpr int GEN_LUT_N = (1 << LUT_WBITS);
 static constexpr int GEN_LUT_SLICES = (256 + LUT_WBITS - 1) / LUT_WBITS;
 static constexpr int GEN_LUT_TOTAL = GEN_LUT_SLICES * GEN_LUT_N;
 
-static AffinePoint* g_gen_lut = nullptr;
-static bool g_lut_built = false;
+static constexpr int MAX_CUDA_DEVICES = 16;
+static AffinePoint* g_gen_lut[MAX_CUDA_DEVICES] = {};
+static bool g_lut_built[MAX_CUDA_DEVICES] = {};
 static std::mutex g_lut_mutex;
 
 __device__ inline void scalar_mul_gen_lut(
@@ -300,26 +301,27 @@ __global__ void GenLutConvertZinvKernel(
 }
 
 static void EnsureGenLutBuilt(int device_id) {
-    if (g_lut_built) return;
+    if (device_id < 0 || device_id >= MAX_CUDA_DEVICES) return;
+    if (g_lut_built[device_id]) return;
     std::lock_guard<std::mutex> lock(g_lut_mutex);
-    if (g_lut_built) return;
+    if (g_lut_built[device_id]) return;
 
     cudaSetDevice(device_id);
     AffinePoint* d_lut = nullptr;
 
     AffinePoint* d_bases = nullptr;
     if (cudaMalloc(&d_bases, GEN_LUT_SLICES * sizeof(AffinePoint)) != cudaSuccess) {
-        g_lut_built = true; return;
+        g_lut_built[device_id] = true; return;
     }
     ComputeLutBasePoints<<<1, 1>>>(d_bases);
     cudaDeviceSynchronize();
 
     if (cudaMalloc(&d_lut, (size_t)GEN_LUT_TOTAL * sizeof(AffinePoint)) != cudaSuccess) {
-        cudaFree(d_bases); g_lut_built = true; return;
+        cudaFree(d_bases); g_lut_built[device_id] = true; return;
     }
     FieldElement* d_h_buf = nullptr;
     if (cudaMalloc(&d_h_buf, (size_t)GEN_LUT_TOTAL * sizeof(FieldElement)) != cudaSuccess) {
-        cudaFree(d_bases); cudaFree(d_lut); g_lut_built = true; return;
+        cudaFree(d_bases); cudaFree(d_lut); g_lut_built[device_id] = true; return;
     }
 
     GenLutBuildAffineKernel<<<GEN_LUT_SLICES, 1>>>(d_bases, d_lut, d_h_buf, GEN_LUT_N);
@@ -333,10 +335,10 @@ static void EnsureGenLutBuilt(int device_id) {
     cudaFree(d_h_buf);
     cudaFree(d_bases);
 
-    g_gen_lut = d_lut;
-    g_lut_built = true;
-    fprintf(stderr, "[CUDA] Generator LUT built (%d MB)\n",
-            (int)(GEN_LUT_TOTAL * sizeof(AffinePoint) / (1024 * 1024)));
+    g_gen_lut[device_id] = d_lut;
+    g_lut_built[device_id] = true;
+    fprintf(stderr, "[CUDA] Generator LUT built on device %d (%d MB)\n",
+            device_id, (int)(GEN_LUT_TOTAL * sizeof(AffinePoint) / (1024 * 1024)));
 }
 
 // ============================================================================
@@ -812,14 +814,15 @@ int UfsecpCudaRunKernelsFull(void* state_handle, uint8_t* match_flags, uint32_t 
     cudaSetDevice(state->device_id);
     EnsureGenLutBuilt(state->device_id);
 
-    if (!g_gen_lut) return -1;  // full pipeline requires LUT
+    AffinePoint* lut = g_gen_lut[state->device_id];
+    if (!lut) return -1;  // full pipeline requires LUT
 
     int threads = 128;
     int blocks = ((int)count + threads - 1) / threads;
 
     // Pass 1: phases 1-4 + add spend key → store candidate X/Z + output points
     BIP352FullPass1<<<blocks, threads, 0, state->stream>>>(
-        state->d_tweak_xy, g_gen_lut,
+        state->d_tweak_xy, lut,
         state->d_cand_x, state->d_cand_z, state->d_output_pts, count);
 
     // Pass 2: fused batch inversion + prefix extraction + matching
@@ -839,6 +842,9 @@ int UfsecpCudaRunKernelsFull(void* state_handle, uint8_t* match_flags, uint32_t 
     cudaStreamSynchronize(state->stream);
 
     cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[CUDA] RunKernelsFull error: %s\n", cudaGetErrorString(err));
+    }
     return (err == cudaSuccess) ? 0 : -1;
 }
 
@@ -907,10 +913,11 @@ int UfsecpCudaRunKernels(void* state_handle, uint8_t* out_x, uint8_t* out_y, uin
     int threads = 128;
     int blocks = ((int)count + threads - 1) / threads;
 
-    if (g_gen_lut) {
+    AffinePoint* lut = g_gen_lut[state->device_id];
+    if (lut) {
         BIP352FusedKernelLUT<<<blocks, threads, 0, state->stream>>>(
             state->d_tweak_xy, state->d_output_x, state->d_output_y,
-            g_gen_lut, count);
+            lut, count);
     } else {
         BIP352FusedKernel<<<blocks, threads, 0, state->stream>>>(
             state->d_tweak_xy, state->d_output_x, state->d_output_y, count);
@@ -925,6 +932,9 @@ int UfsecpCudaRunKernels(void* state_handle, uint8_t* out_x, uint8_t* out_y, uin
     cudaStreamSynchronize(state->stream);
 
     cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[CUDA] RunKernels (legacy) error: %s\n", cudaGetErrorString(err));
+    }
     return (err == cudaSuccess) ? 0 : -1;
 }
 
