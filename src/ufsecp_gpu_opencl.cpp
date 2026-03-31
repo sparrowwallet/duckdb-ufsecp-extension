@@ -3,6 +3,7 @@
 // ============================================================================
 
 #include "secp256k1_opencl.hpp"
+#include "opencl_loader.h"
 #include <secp256k1/tagged_hash.hpp>
 #include <secp256k1/sha256.hpp>
 #include <CL/cl.h>
@@ -222,6 +223,11 @@ extern "C" {
 int UfsecpOclDetect(int *num_gpus) {
 	std::lock_guard<std::mutex> lock(g_ocl_mutex);
 	if (!g_ocl_initialized) {
+		if (!opencl_loader_init()) {
+			*num_gpus = 0;
+			g_ocl_initialized = true;
+			return 0;
+		}
 		ocl::DeviceConfig config;
 		config.verbose = false;
 		config.max_batch_size = 1000000;
@@ -425,7 +431,7 @@ fail:
 
 int UfsecpOclRunKernelsFull(void *state_handle, uint8_t *match_flags, uint32_t count) {
 	auto *state = static_cast<UfsecpOclBatchState *>(state_handle);
-	if (!state || !g_ocl_ctx || !g_ocl_gen_lut || !g_ocl_spend_buf)
+	if (!state || !g_ocl_ctx || !g_ocl_spend_buf)
 		return -1;
 
 	auto *queue = static_cast<cl_command_queue>(g_ocl_ctx->native_queue());
@@ -451,8 +457,10 @@ int UfsecpOclRunKernelsFull(void *state_handle, uint8_t *match_flags, uint32_t c
 
 		size_t local = 128, global = ((count + local - 1) / local) * local;
 		cl_int err = clEnqueueNDRangeKernel(queue, k, 1, nullptr, &global, &local, 0, nullptr, nullptr);
-		if (err != CL_SUCCESS)
+		if (err != CL_SUCCESS) {
+			fprintf(stderr, "[OpenCL] Full pass1 kernel failed: err=%d\n", err);
 			return -1;
+		}
 	}
 
 	// Pass 2: fused batch inversion + match
@@ -474,8 +482,10 @@ int UfsecpOclRunKernelsFull(void *state_handle, uint8_t *match_flags, uint32_t c
 
 		size_t global = ((count + local - 1) / local) * local;
 		cl_int err = clEnqueueNDRangeKernel(queue, k, 1, nullptr, &global, &local, 0, nullptr, nullptr);
-		if (err != CL_SUCCESS)
+		if (err != CL_SUCCESS) {
+			fprintf(stderr, "[OpenCL] Batch inv+match kernel failed: err=%d\n", err);
 			return -1;
+		}
 	}
 
 	clEnqueueReadBuffer(queue, state->match_flags_buf, CL_TRUE, 0, count, match_flags, 0, nullptr, nullptr);
