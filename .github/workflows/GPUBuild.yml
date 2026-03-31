@@ -39,9 +39,9 @@ jobs:
 
       - name: Install CUDA Toolkit
         if: ${{ matrix.install_cuda }}
-        uses: Jimver/cuda-toolkit@v0.2.30
+        uses: Jimver/cuda-toolkit@v0.2.35
         with:
-          cuda: '13.1.0'
+          cuda: '12.8.1'
           method: 'network'
 
       - name: Install OpenCL development files (Linux)
