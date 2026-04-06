@@ -128,11 +128,28 @@ Sets the directory for the precomputed lookup table cache and eagerly builds the
 SELECT ufsecp_set_cache_dir('/path/to/cache');
 ```
 
-This writes a ~244 MB file (`cache_w18.bin`) to the specified directory. The table is used for fast fixed-base scalar multiplication and is generated once on first use.
+This writes a ~6 MB file (`cache_w12.bin`) to the specified directory. The table is used for fast fixed-base scalar multiplication and is generated once on first use.
+
+### `ufsecp_progress(scan_key)`
+
+Returns the progress of an active scan as a percentage (0-100), or -1 if no scan is in progress for the given key. Used as a side-channel for progress reporting since DuckDB's `QueryProgress` does not track `in_out_function` table functions.
+
+**Parameters:**
+- `scan_key` (BLOB): 32-byte scan private key (same key passed to `ufsecp_scan`)
+
+**Returns:** DOUBLE
+- `-1.0`: No scan in progress for this key
+- `0.0 - 100.0`: Percentage of received rows that have been processed
+
+```sql
+SELECT ufsecp_progress(from_hex('0f694e068028a717f8af6b9411f9a133dd3565258714cc226594b34db90c1f2c'));
+```
+
+Progress is tracked per scan key. The entry is created when `ufsecp_scan` binds and removed when the query completes or is cancelled.
 
 ## Precomputed table cache
 
-UltrafastSecp256k1 generates a ~244 MB precomputed lookup table (`cache_w18.bin`) on first use for fast fixed-scalar multiplication. This file is written to the current working directory by default.
+UltrafastSecp256k1 generates a ~6 MB precomputed lookup table (`cache_w12.bin`) on first use for fast fixed-base scalar multiplication. This file is written to the current working directory by default.
 
 To control the cache location, call `ufsecp_set_cache_dir()` after loading the extension, or set the environment variable before loading:
 
@@ -143,7 +160,7 @@ export SECP256K1_CACHE_DIR=/path/to/cache/directory
 Or set the exact file path:
 
 ```bash
-export SECP256K1_CACHE_PATH=/path/to/cache_w18.bin
+export SECP256K1_CACHE_PATH=/path/to/cache_w12.bin
 ```
 
 ## Dependencies
