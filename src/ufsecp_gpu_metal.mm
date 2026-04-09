@@ -107,7 +107,6 @@ struct UfsecpMetalBatchState {
     mtl::MetalBuffer cand_x_buf;
     mtl::MetalBuffer cand_z_buf;
     mtl::MetalBuffer output_pts_buf;
-    mtl::MetalBuffer scratch_buf;
 
     // Multi-dispatch fallback (existing fields)
     std::vector<mtl::HostScalar> scan_scalars;
@@ -567,13 +566,6 @@ void *UfsecpMetalLaunchBatchFull(
     std::memcpy(state->midstate_buf.contents(), g_bip352_midstate, 32);
     state->count_buf.write(&count, 1);
 
-    // Scratch buffer for batch inversion (device memory instead of threadgroup)
-    // 2 * tgsize * FIELD_ELEMENT_SIZE per threadgroup
-    uint32_t tgsize = 256;
-    uint32_t num_threadgroups = (count + tgsize - 1) / tgsize;
-    size_t scratch_size = (size_t)num_threadgroups * 2 * tgsize * FIELD_ELEMENT_SIZE;
-    state->scratch_buf = g_runtime->alloc_buffer(scratch_size);
-
     return state;
 }
 
@@ -608,7 +600,7 @@ int UfsecpMetalRunKernelsFull(void *state_handle, uint8_t *match_flags, uint32_t
             &state->output_pts_buf, &g_spend_buf,
             &state->output_prefixes_buf, &state->output_offsets_buf,
             &state->output_lengths_buf, &state->match_flags_buf,
-            &state->count_buf, &state->scratch_buf
+            &state->count_buf
         };
         g_runtime->dispatch_sync(g_batch_inv_pipeline, state->count, tg, bufs);
     }

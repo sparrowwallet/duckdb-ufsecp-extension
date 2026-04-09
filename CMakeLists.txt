@@ -227,7 +227,6 @@ if(UFSECP_ENABLE_METAL)
         DEPENDS
             ${METAL_SHADER_DIR}/secp256k1_field.h
             ${METAL_SHADER_DIR}/secp256k1_point.h
-            ${METAL_SHADER_DIR}/secp256k1_bloom.h
             ${METAL_SHADER_DIR}/secp256k1_extended.h
             ${METAL_SHADER_DIR}/secp256k1_hash160.h
             ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_metal_shaders.cmake

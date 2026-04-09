@@ -4,7 +4,7 @@
 #   SHADER_DIR  -- Path to UltrafastSecp256k1/metal/shaders/
 #   OUTPUT_FILE -- Path to write metal_shader_source.h
 #
-# Reads the 5 required shader headers (field, point, bloom, extended, hash160),
+# Reads the required shader headers (field, point, extended, hash160),
 # strips #include and #pragma once lines, prepends Metal stdlib header, and
 # appends inline scalar_mul_batch + generator_mul_batch kernel definitions.
 # Writes the result as a C++ raw string literal.
@@ -12,7 +12,6 @@
 set(SHADER_FILES
     "${SHADER_DIR}/secp256k1_field.h"
     "${SHADER_DIR}/secp256k1_point.h"
-    "${SHADER_DIR}/secp256k1_bloom.h"
     "${SHADER_DIR}/secp256k1_extended.h"
     "${SHADER_DIR}/secp256k1_hash160.h"
 )
@@ -634,10 +633,12 @@ kernel void bip352_full_pass1(
 }
 
 // =============================================================================
-// Batch inversion helpers (using device memory buffers)
+// Batch inversion helpers (using threadgroup memory)
 // =============================================================================
 
-inline void metal_block_prefix_mul(device FieldElement *data, uint tid, uint n) {
+constant uint BATCH_INV_TGSIZE = 256;
+
+inline void tg_prefix_mul(threadgroup FieldElement *data, uint tid, uint n) {
     for (uint offset = 1; offset < n; offset *= 2) {
         FieldElement val;
         bool do_write = false;
@@ -647,13 +648,13 @@ inline void metal_block_prefix_mul(device FieldElement *data, uint tid, uint n) 
             val = field_mul(a, b);
             do_write = true;
         }
-        threadgroup_barrier(mem_flags::mem_device);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         if (do_write) data[tid] = val;
-        threadgroup_barrier(mem_flags::mem_device);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
 
-inline void metal_block_suffix_mul(device FieldElement *data, uint tid, uint n) {
+inline void tg_suffix_mul(threadgroup FieldElement *data, uint tid, uint n) {
     for (uint offset = 1; offset < n; offset *= 2) {
         FieldElement val;
         bool do_write = false;
@@ -663,26 +664,26 @@ inline void metal_block_suffix_mul(device FieldElement *data, uint tid, uint n) 
             val = field_mul(a, b);
             do_write = true;
         }
-        threadgroup_barrier(mem_flags::mem_device);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         if (do_write) data[tid] = val;
-        threadgroup_barrier(mem_flags::mem_device);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
 
-inline void metal_block_batch_invert(
+inline void tg_batch_invert(
     FieldElement z_val,
     thread FieldElement &z_inv_out,
-    device FieldElement *L,
-    device FieldElement *R,
+    threadgroup FieldElement *L,
+    threadgroup FieldElement *R,
     uint tid,
     uint valid_in_block)
 {
     L[tid] = z_val;
     R[tid] = z_val;
-    threadgroup_barrier(mem_flags::mem_device);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    metal_block_prefix_mul(L, tid, valid_in_block);
-    metal_block_suffix_mul(R, tid, valid_in_block);
+    tg_prefix_mul(L, tid, valid_in_block);
+    tg_suffix_mul(R, tid, valid_in_block);
 
     // Thread 0 computes total inverse and broadcasts via R[0]
     if (tid == 0 && valid_in_block > 0) {
@@ -690,7 +691,7 @@ inline void metal_block_batch_invert(
         FieldElement inv_result = field_inv(total_prod);
         R[0] = inv_result;
     }
-    threadgroup_barrier(mem_flags::mem_device);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     FieldElement total_inv = R[0];
 
@@ -705,7 +706,7 @@ inline void metal_block_batch_invert(
     }
 
     z_inv_out = z_inv;
-    threadgroup_barrier(mem_flags::mem_device);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
 inline long metal_extract_prefix(thread const FieldElement &jac_x, thread const FieldElement &z_inv) {
@@ -732,16 +733,14 @@ kernel void bip352_batch_inv_match(
     device const uchar *output_lengths      [[buffer(6)]],
     device uchar *match_flags               [[buffer(7)]],
     constant uint &count                    [[buffer(8)]],
-    device FieldElement *scratch_buf        [[buffer(9)]],
     uint tid [[thread_position_in_threadgroup]],
     uint gid [[thread_position_in_grid]],
     uint tgsize [[threads_per_threadgroup]],
     uint tgid [[threadgroup_position_in_grid]]
 ) {
-    // Each threadgroup gets its own slice of scratch_buf
-    uint tg_offset = tgid * tgsize * 2;
-    device FieldElement *L = scratch_buf + tg_offset;
-    device FieldElement *R = scratch_buf + tg_offset + tgsize;
+    // Threadgroup-local scratch for batch inversion
+    threadgroup FieldElement L[BATCH_INV_TGSIZE];
+    threadgroup FieldElement R[BATCH_INV_TGSIZE];
 
     uint group_start = gid - tid;
     uint valid_in_block = min(count - group_start, tgsize);
@@ -755,7 +754,7 @@ kernel void bip352_batch_inv_match(
     {
         FieldElement z_val = valid ? cand_z[gid] : field_one();
         FieldElement z_inv;
-        metal_block_batch_invert(z_val, z_inv, L, R, tid, valid_in_block);
+        tg_batch_invert(z_val, z_inv, L, R, tid, valid_in_block);
 
         if (valid && !found) {
             FieldElement cx = cand_x[gid];
@@ -767,7 +766,7 @@ kernel void bip352_batch_inv_match(
 
     // Rounds 2+: label keys
     for (uchar lbl = 0; lbl < spend.num_labels; lbl++) {
-        threadgroup_barrier(mem_flags::mem_device);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
         FieldElement label_z = field_one();
         FieldElement label_cx;
@@ -780,7 +779,7 @@ kernel void bip352_batch_inv_match(
         }
 
         FieldElement label_z_inv;
-        metal_block_batch_invert(label_z, label_z_inv, L, R, tid, valid_in_block);
+        tg_batch_invert(label_z, label_z_inv, L, R, tid, valid_in_block);
 
         if (valid && !found) {
             long label_pfx = metal_extract_prefix(label_cx, label_z_inv);
