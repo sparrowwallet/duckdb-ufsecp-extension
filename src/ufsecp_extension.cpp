@@ -71,10 +71,11 @@ void UfsecpOclFreeBatch(void *state_handle);
 #ifdef UFSECP_METAL_ENABLED
 extern "C" {
 int UfsecpMetalDetect(int *num_gpus);
-void UfsecpMetalSetSpendKey(const uint8_t *spend_xy, int num_labels, const uint8_t *label_keys_xy, int device_id);
+void UfsecpMetalEnsureReady();
 void *UfsecpMetalLaunchBatchFull(const uint8_t *tweak_data, const int64_t *output_prefixes, uint32_t total_outputs,
                                  const uint32_t *output_offsets, const uint8_t *output_lengths, uint32_t count,
-                                 int device_id, const void *precomp);
+                                 int device_id, const void *precomp, const uint8_t *spend_xy, int num_labels,
+                                 const uint8_t *label_keys_xy);
 int UfsecpMetalRunKernelsFull(void *state_handle, uint8_t *match_flags, uint32_t count);
 void *UfsecpMetalLaunchBatch(const uint8_t *scan_key, const uint8_t *tweak_data, uint32_t count, int device_id,
                              const void *precomp);
@@ -104,9 +105,15 @@ static bool g_gpu_detected = false;
 static std::mutex g_gpu_init_mutex;
 
 // Function pointers for the active GPU backend — full pipeline (phases 1-6)
+// Old API (CUDA/OpenCL): separate SetSpendKey upload + LaunchBatchFull
 static void (*g_gpu_set_spend)(const uint8_t *, int, const uint8_t *, int) = nullptr;
 static void *(*g_gpu_launch_full)(const uint8_t *, const int64_t *, uint32_t, const uint32_t *, const uint8_t *,
                                   uint32_t, int, const void *) = nullptr;
+// New API (Metal): spend bytes passed inline, no global; eager init replaces lazy LUT build
+static void (*g_gpu_ensure_ready)() = nullptr;
+static void *(*g_gpu_launch_full_with_spend)(const uint8_t *, const int64_t *, uint32_t, const uint32_t *,
+                                             const uint8_t *, uint32_t, int, const void *, const uint8_t *, int,
+                                             const uint8_t *) = nullptr;
 static int (*g_gpu_run_full)(void *, uint8_t *, uint32_t) = nullptr;
 
 // Function pointers for the active GPU backend — legacy (phases 1-4, fallback)
@@ -165,8 +172,8 @@ static void EnsureGpuDetected() {
 		if (metal_gpus > 0) {
 			g_num_gpus = metal_gpus;
 			g_gpu_backend = GpuBackend::METAL;
-			g_gpu_set_spend = UfsecpMetalSetSpendKey;
-			g_gpu_launch_full = UfsecpMetalLaunchBatchFull;
+			g_gpu_ensure_ready = UfsecpMetalEnsureReady;
+			g_gpu_launch_full_with_spend = UfsecpMetalLaunchBatchFull;
 			g_gpu_run_full = UfsecpMetalRunKernelsFull;
 			g_gpu_launch = UfsecpMetalLaunchBatch;
 			g_gpu_run = UfsecpMetalRunKernels;
@@ -269,11 +276,10 @@ struct UfsecpScanBindData : public TableFunctionData {
 // ============================================================================
 
 struct UfsecpScanLocalState : public LocalTableFunctionState {
-	UfsecpScanLocalState() : finalized(false), is_output_thread(false) {
+	UfsecpScanLocalState() : finalized(false), match_position(0) {
 	}
 
 	bool finalized;
-	bool is_output_thread;
 
 	// Per-thread accumulated input data (same layout as cudasp)
 	vector<std::string> accumulated_txids;
@@ -282,6 +288,15 @@ struct UfsecpScanLocalState : public LocalTableFunctionState {
 	vector<int64_t> accumulated_outputs;
 	vector<idx_t> accumulated_output_offsets;
 	vector<idx_t> accumulated_output_lengths;
+
+	// Per-thread match output (emitted in chunks from this thread's Finalize).
+	// Storing per-thread instead of in a single global avoids the cross-thread
+	// race where a no-data thread becomes the "output thread" before the
+	// data-having threads have populated their matches.
+	vector<std::string> match_txids;
+	vector<int32_t> match_heights;
+	vector<std::string> match_tweak_keys;
+	idx_t match_position;
 
 	// Reusable scratch buffers (avoid per-batch heap allocation)
 	std::vector<FieldElement> scratch;
@@ -296,26 +311,11 @@ struct UfsecpScanLocalState : public LocalTableFunctionState {
 // ============================================================================
 
 struct UfsecpScanState : public GlobalTableFunctionState {
-	UfsecpScanState() : currently_adding(0), output_position(0), output_thread_claimed(false) {
-		finalize_lock = make_uniq<std::mutex>();
-		output_lock = make_uniq<std::mutex>();
+	UfsecpScanState() {
 	}
 
-	// Thread synchronization
-	std::atomic_uint64_t currently_adding;
-	unique_ptr<std::mutex> finalize_lock;
-
-	// Global output storage — all threads write here under lock
-	unique_ptr<std::mutex> output_lock;
-	vector<string> output_txids;
-	vector<int32_t> output_heights;
-	vector<string> output_tweak_keys;
-	idx_t output_position;
-
-	// Only one thread returns output to avoid batch index conflicts
-	std::atomic<bool> output_thread_claimed;
-
-	// GPU spend key uploaded flag
+	// GPU spend key uploaded flag (legacy CUDA/OpenCL path that still uses a
+	// process-global spend buffer; new Metal path passes spend bytes inline)
 	std::atomic<bool> spend_key_uploaded {false};
 };
 
@@ -505,17 +505,15 @@ static void ProcessBatch(UfsecpScanLocalState &local_state, const UfsecpScanBind
 	}
 
 	// ================================================================
-	// Phase 6: Write matches to global output
+	// Phase 6: Stash matches in this thread's local match buffer
 	// ================================================================
-	global_state.output_lock->lock();
 	for (idx_t i = 0; i < N; i++) {
 		if (matched[i]) {
-			global_state.output_txids.push_back(local_state.accumulated_txids[i]);
-			global_state.output_heights.push_back(local_state.accumulated_heights[i]);
-			global_state.output_tweak_keys.push_back(local_state.accumulated_tweak_keys[i]);
+			local_state.match_txids.push_back(std::move(local_state.accumulated_txids[i]));
+			local_state.match_heights.push_back(local_state.accumulated_heights[i]);
+			local_state.match_tweak_keys.push_back(std::move(local_state.accumulated_tweak_keys[i]));
 		}
 	}
-	global_state.output_lock->unlock();
 
 	// Clear accumulated input after processing
 	local_state.accumulated_txids.clear();
@@ -529,10 +527,6 @@ static void ProcessBatch(UfsecpScanLocalState &local_state, const UfsecpScanBind
 // ============================================================================
 // Helper predicates
 // ============================================================================
-
-static bool HasOutput(const UfsecpScanState &global_state) {
-	return global_state.output_position < global_state.output_txids.size();
-}
 
 static bool ShouldProcessBatch(const UfsecpScanLocalState &local_state, const UfsecpScanBindData &bind_data) {
 	return local_state.accumulated_txids.size() >= bind_data.batch_size;
@@ -575,28 +569,29 @@ static void ProcessBatchGpu(UfsecpScanLocalState &local_state, const UfsecpScanB
 	if (N == 0)
 		return;
 
-	// Upload spend key to GPU once per query (thread-safe: worst case is redundant upload)
-	if (g_gpu_set_spend && !global_state.spend_key_uploaded) {
-		const uint8_t *sp = reinterpret_cast<const uint8_t *>(bind_data.spend_public_key_data.data());
+	const uint8_t *spend_xy = reinterpret_cast<const uint8_t *>(bind_data.spend_public_key_data.data());
+	int num_labels = (int)bind_data.labelled_spend_keys.size();
 
-		// Build label keys as contiguous LE bytes
-		std::vector<uint8_t> label_buf;
-		for (auto &lsk : bind_data.labelled_spend_keys) {
-			uint8_t lk[64];
-			// FieldElement to LE bytes
-			for (int i = 0; i < 4; i++) {
-				uint64_t xv = lsk.x.limbs()[i], yv = lsk.y.limbs()[i];
-				for (int j = 0; j < 8; j++) {
-					lk[i * 8 + j] = (uint8_t)(xv >> (j * 8));
-					lk[32 + i * 8 + j] = (uint8_t)(yv >> (j * 8));
-				}
+	// Build label keys as contiguous LE bytes (consumed by both API paths below)
+	std::vector<uint8_t> label_buf;
+	for (auto &lsk : bind_data.labelled_spend_keys) {
+		uint8_t lk[64];
+		for (int i = 0; i < 4; i++) {
+			uint64_t xv = lsk.x.limbs()[i], yv = lsk.y.limbs()[i];
+			for (int j = 0; j < 8; j++) {
+				lk[i * 8 + j] = (uint8_t)(xv >> (j * 8));
+				lk[32 + i * 8 + j] = (uint8_t)(yv >> (j * 8));
 			}
-			label_buf.insert(label_buf.end(), lk, lk + 64);
 		}
+		label_buf.insert(label_buf.end(), lk, lk + 64);
+	}
+	const uint8_t *label_ptr = label_buf.empty() ? nullptr : label_buf.data();
 
+	// Old API: upload spend key once per query via SetSpendKey (CUDA/OpenCL).
+	// New API (g_gpu_launch_full_with_spend) passes spend bytes inline, no global upload needed.
+	if (g_gpu_set_spend && !global_state.spend_key_uploaded) {
 		for (int gpu = 0; gpu < g_num_gpus; gpu++) {
-			g_gpu_set_spend(sp, (int)bind_data.labelled_spend_keys.size(),
-			                label_buf.empty() ? nullptr : label_buf.data(), gpu);
+			g_gpu_set_spend(spend_xy, num_labels, label_ptr, gpu);
 		}
 		global_state.spend_key_uploaded = true;
 	}
@@ -612,7 +607,7 @@ static void ProcessBatchGpu(UfsecpScanLocalState &local_state, const UfsecpScanB
 	// ====================================================================
 	// Try full pipeline (phases 1-6 on GPU)
 	// ====================================================================
-	if (g_gpu_launch_full) {
+	if (g_gpu_launch_full_with_spend || g_gpu_launch_full) {
 		// Marshal output offsets and lengths
 		std::vector<uint32_t> output_offsets(N);
 		std::vector<uint8_t> output_lengths(N);
@@ -622,9 +617,17 @@ static void ProcessBatchGpu(UfsecpScanLocalState &local_state, const UfsecpScanB
 		}
 		uint32_t total_outputs = static_cast<uint32_t>(local_state.accumulated_outputs.size());
 
-		void *gpu_state = g_gpu_launch_full(tweak_buf.data(), local_state.accumulated_outputs.data(), total_outputs,
-		                                    output_offsets.data(), output_lengths.data(), static_cast<uint32_t>(N),
-		                                    local_state.assigned_gpu, &scan_glv);
+		void *gpu_state = nullptr;
+		if (g_gpu_launch_full_with_spend) {
+			gpu_state =
+			    g_gpu_launch_full_with_spend(tweak_buf.data(), local_state.accumulated_outputs.data(), total_outputs,
+			                                 output_offsets.data(), output_lengths.data(), static_cast<uint32_t>(N),
+			                                 local_state.assigned_gpu, &scan_glv, spend_xy, num_labels, label_ptr);
+		} else {
+			gpu_state = g_gpu_launch_full(tweak_buf.data(), local_state.accumulated_outputs.data(), total_outputs,
+			                              output_offsets.data(), output_lengths.data(), static_cast<uint32_t>(N),
+			                              local_state.assigned_gpu, &scan_glv);
+		}
 
 		if (gpu_state) {
 			std::vector<uint8_t> match_flags(N);
@@ -632,16 +635,14 @@ static void ProcessBatchGpu(UfsecpScanLocalState &local_state, const UfsecpScanB
 			g_gpu_free(gpu_state);
 
 			if (result == 0) {
-				// Write matches to global output
-				global_state.output_lock->lock();
+				// Stash matches in this thread's local match buffer
 				for (idx_t i = 0; i < N; i++) {
 					if (match_flags[i]) {
-						global_state.output_txids.push_back(local_state.accumulated_txids[i]);
-						global_state.output_heights.push_back(local_state.accumulated_heights[i]);
-						global_state.output_tweak_keys.push_back(local_state.accumulated_tweak_keys[i]);
+						local_state.match_txids.push_back(std::move(local_state.accumulated_txids[i]));
+						local_state.match_heights.push_back(local_state.accumulated_heights[i]);
+						local_state.match_tweak_keys.push_back(std::move(local_state.accumulated_tweak_keys[i]));
 					}
 				}
-				global_state.output_lock->unlock();
 
 				local_state.accumulated_txids.clear();
 				local_state.accumulated_heights.clear();
@@ -656,7 +657,7 @@ static void ProcessBatchGpu(UfsecpScanLocalState &local_state, const UfsecpScanB
 			fprintf(stderr, "[GPU] Full pipeline launch returned null, falling back to legacy\n");
 		}
 	} else {
-		fprintf(stderr, "[GPU] g_gpu_launch_full is null, falling back to legacy\n");
+		fprintf(stderr, "[GPU] no full-pipeline launch fn, falling back to legacy\n");
 	}
 
 	// ====================================================================
@@ -734,15 +735,13 @@ static void ProcessBatchGpu(UfsecpScanLocalState &local_state, const UfsecpScanB
 		}
 	}
 
-	global_state.output_lock->lock();
 	for (idx_t i = 0; i < N; i++) {
 		if (matched[i]) {
-			global_state.output_txids.push_back(local_state.accumulated_txids[i]);
-			global_state.output_heights.push_back(local_state.accumulated_heights[i]);
-			global_state.output_tweak_keys.push_back(local_state.accumulated_tweak_keys[i]);
+			local_state.match_txids.push_back(std::move(local_state.accumulated_txids[i]));
+			local_state.match_heights.push_back(local_state.accumulated_heights[i]);
+			local_state.match_tweak_keys.push_back(std::move(local_state.accumulated_tweak_keys[i]));
 		}
 	}
-	global_state.output_lock->unlock();
 
 	local_state.accumulated_txids.clear();
 	local_state.accumulated_heights.clear();
@@ -863,6 +862,11 @@ static unique_ptr<FunctionData> UfsecpScanBind(ClientContext &context, TableFunc
 	} else {
 		bind_data->use_gpu = false;
 	}
+	// Eager backend init (e.g. build LUT) on this single thread before any
+	// worker thread runs. Avoids races on lazy first-use init from workers.
+	if (bind_data->use_gpu && g_gpu_ensure_ready) {
+		g_gpu_ensure_ready();
+	}
 #else
 	if (bind_data->backend == "gpu") {
 		throw InvalidInputException("backend='gpu' requested but extension was compiled without GPU support");
@@ -924,8 +928,6 @@ static unique_ptr<GlobalTableFunctionState> UfsecpScanInit(ClientContext &contex
 
 static unique_ptr<LocalTableFunctionState> UfsecpScanLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
                                                                GlobalTableFunctionState *global_state) {
-	auto &state = global_state->Cast<UfsecpScanState>();
-	state.currently_adding++;
 	auto local_state = make_uniq<UfsecpScanLocalState>();
 
 #ifdef UFSECP_GPU_ENABLED
@@ -981,7 +983,8 @@ static OperatorFinalizeResultType UfsecpScanFinalFunction(ExecutionContext &cont
 	auto &state = data_p.global_state->Cast<UfsecpScanState>();
 	auto &local_state = data_p.local_state->Cast<UfsecpScanLocalState>();
 
-	// Process any remaining accumulated data from this thread
+	// Process any remaining accumulated data from this thread (only once;
+	// subsequent calls just drain match_* below).
 	if (!local_state.finalized && !local_state.accumulated_txids.empty()) {
 		idx_t batch_count = local_state.accumulated_txids.size();
 #ifdef UFSECP_GPU_ENABLED
@@ -995,53 +998,39 @@ static OperatorFinalizeResultType UfsecpScanFinalFunction(ExecutionContext &cont
 #endif
 		bind_data.progress->rows_processed += batch_count;
 	}
+	local_state.finalized = true;
 
-	// Decrement thread counter only once per thread
-	if (!local_state.finalized) {
-		state.finalize_lock->lock();
-		state.currently_adding--;
-		local_state.finalized = true;
-		state.finalize_lock->unlock();
-	}
-
-	// Single-output-thread pattern: only one thread returns output
-	// to avoid batch index conflicts in DuckDB
-	if (!local_state.is_output_thread) {
-		if (state.currently_adding != 0) {
-			return OperatorFinalizeResultType::FINISHED;
-		}
-		bool expected = false;
-		if (!state.output_thread_claimed.compare_exchange_strong(expected, true)) {
-			return OperatorFinalizeResultType::FINISHED;
-		}
-		local_state.is_output_thread = true;
-	}
-
-	// Return output from global state in STANDARD_VECTOR_SIZE chunks
-	if (HasOutput(state)) {
+	// Drain this thread's local matches in chunks of STANDARD_VECTOR_SIZE.
+	// Each thread emits its own matches independently — DuckDB combines the
+	// per-thread chunks into the final result. This avoids a global
+	// "single output thread" claim that races with DuckDB's interleaved
+	// LocalInit/Finalize lifecycle.
+	idx_t total = local_state.match_txids.size();
+	idx_t pos = local_state.match_position;
+	if (pos < total) {
 		auto &txid_result = output.data[0];
 		auto &height_result = output.data[1];
 		auto &tweak_key_result = output.data[2];
 
-		idx_t output_count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, state.output_txids.size() - state.output_position);
+		idx_t output_count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, total - pos);
 
 		auto txid_data = FlatVector::GetData<string_t>(txid_result);
 		auto height_data = FlatVector::GetData<int32_t>(height_result);
 		auto tweak_key_data = FlatVector::GetData<string_t>(tweak_key_result);
 
 		for (idx_t i = 0; i < output_count; i++) {
-			auto &txid = state.output_txids[state.output_position + i];
-			auto &tweak_key = state.output_tweak_keys[state.output_position + i];
+			auto &txid = local_state.match_txids[pos + i];
+			auto &tweak_key = local_state.match_tweak_keys[pos + i];
 			txid_data[i] = StringVector::AddStringOrBlob(txid_result, string_t(txid.data(), txid.size()));
-			height_data[i] = state.output_heights[state.output_position + i];
+			height_data[i] = local_state.match_heights[pos + i];
 			tweak_key_data[i] =
 			    StringVector::AddStringOrBlob(tweak_key_result, string_t(tweak_key.data(), tweak_key.size()));
 		}
 
 		output.SetCardinality(output_count);
-		state.output_position += output_count;
+		local_state.match_position += output_count;
 
-		if (HasOutput(state)) {
+		if (local_state.match_position < total) {
 			return OperatorFinalizeResultType::HAVE_MORE_OUTPUT;
 		}
 	}

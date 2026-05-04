@@ -80,9 +80,9 @@ static mtl::ComputePipeline g_lut_convert_pipeline;
 // LUT fused kernel pipeline
 static mtl::ComputePipeline g_fused_lut_pipeline;
 
-// Full pipeline state (phases 1-6)
-static mtl::MetalBuffer g_spend_buf;
-static bool g_spend_uploaded = false;
+// Full pipeline state (phases 1-6) — spend key buffer is per-batch (in
+// UfsecpMetalBatchState), not global, since concurrent scans may carry
+// different keys.
 static mtl::ComputePipeline g_full_pass1_pipeline;
 static mtl::ComputePipeline g_batch_inv_pipeline;
 
@@ -100,6 +100,7 @@ struct UfsecpMetalBatchState {
     mtl::MetalBuffer count_buf;
 
     // Full pipeline fields (phases 1-6)
+    mtl::MetalBuffer spend_buf;
     mtl::MetalBuffer output_prefixes_buf;
     mtl::MetalBuffer output_offsets_buf;
     mtl::MetalBuffer output_lengths_buf;
@@ -212,7 +213,9 @@ static void compute_bip352_midstate(uint32_t out[8]) {
 // ============================================================================
 
 static void EnsureGenLutBuilt() {
-    if (g_lut_built) return;
+    // No fast-path early-return: the flags are non-atomic and ARM may reorder
+    // their visibility relative to g_gen_lut_buf. Always take the mutex.
+    // After first build the lock is uncontended; cost is negligible.
     std::lock_guard<std::mutex> lock(g_lut_mutex);
     if (g_lut_built) return;
 
@@ -374,8 +377,7 @@ int UfsecpMetalRunKernels(void *state_handle, uint8_t *out_x, uint8_t *out_y, ui
     // Fused path: single GPU dispatch
     // ====================================================================
     if (state->use_fused) {
-        // Build LUT on first use (blocks until complete, thread-safe)
-        EnsureGenLutBuilt();
+        // LUT is built eagerly in UfsecpMetalEnsureReady (called from Bind).
 
         uint32_t tg = g_fused_pipeline.threadExecutionWidth();
         if (tg == 0) tg = 256;
@@ -491,37 +493,23 @@ void UfsecpMetalFreeBatch(void *state_handle) {
 // Full pipeline: phases 1-6 on GPU (spend key + batch inversion + matching)
 // ============================================================================
 
-void UfsecpMetalSetSpendKey(const uint8_t *spend_xy, int num_labels,
-                            const uint8_t *label_keys_xy, int device_id) {
-    (void)device_id;
-    if (!g_runtime) return;
-
-    // BIP352SpendKeys: base(64) + labels[16](1024) + num_labels(1) + pad(3) = 1092
-    static constexpr size_t SPEND_SIZE = 64 + 16 * 64 + 4;
-    uint8_t spend_data[SPEND_SIZE] = {};
-
-    std::memcpy(spend_data, spend_xy, 64);
-
-    int n = (num_labels > 16) ? 16 : num_labels;
-    if (label_keys_xy && n > 0)
-        std::memcpy(spend_data + 64, label_keys_xy, n * 64);
-
-    spend_data[64 + 16 * 64] = (uint8_t)n;
-
-    g_spend_buf = g_runtime->alloc_buffer(SPEND_SIZE);
-    std::memcpy(g_spend_buf.contents(), spend_data, SPEND_SIZE);
-    g_spend_uploaded = true;
+// Eager backend init: build the LUT on the bind thread before any worker
+// runs. The LUT depends only on the curve (not on per-scan keys), so it is
+// safe to build once per process.
+void UfsecpMetalEnsureReady() {
+    if (!g_runtime || g_metal_device_count == 0) return;
+    EnsureGenLutBuilt();
 }
 
 void *UfsecpMetalLaunchBatchFull(
     const uint8_t *tweak_data, const int64_t *output_prefixes, uint32_t total_outputs,
     const uint32_t *output_offsets, const uint8_t *output_lengths,
-    uint32_t count, int device_id, const void *precomp) {
+    uint32_t count, int device_id, const void *precomp,
+    const uint8_t *spend_xy, int num_labels, const uint8_t *label_keys_xy) {
     (void)device_id;
 
     if (!g_runtime || g_metal_device_count == 0 ||
-        !g_full_pass1_pipeline.valid() || !g_batch_inv_pipeline.valid() ||
-        !g_spend_uploaded)
+        !g_full_pass1_pipeline.valid() || !g_batch_inv_pipeline.valid())
         return nullptr;
 
     auto *state = new UfsecpMetalBatchState();
@@ -534,6 +522,18 @@ void *UfsecpMetalLaunchBatchFull(
     state->scan_plan_buf = g_runtime->alloc_buffer(264);
     std::memcpy(state->tweak_buf.contents(), tweak_data, (size_t)count * 64);
     std::memcpy(state->scan_plan_buf.contents(), precomp, 264);
+
+    // Spend key + labels (per-batch, so concurrent scans with different keys
+    // do not race on a shared global)
+    static constexpr size_t SPEND_SIZE = 64 + 16 * 64 + 4;
+    uint8_t spend_data[SPEND_SIZE] = {};
+    std::memcpy(spend_data, spend_xy, 64);
+    int n = (num_labels > 16) ? 16 : num_labels;
+    if (label_keys_xy && n > 0)
+        std::memcpy(spend_data + 64, label_keys_xy, (size_t)n * 64);
+    spend_data[64 + 16 * 64] = (uint8_t)n;
+    state->spend_buf = g_runtime->alloc_buffer(SPEND_SIZE);
+    std::memcpy(state->spend_buf.contents(), spend_data, SPEND_SIZE);
 
     // Output prefix data
     state->output_prefixes_buf = g_runtime->alloc_buffer(
@@ -573,7 +573,9 @@ int UfsecpMetalRunKernelsFull(void *state_handle, uint8_t *match_flags, uint32_t
     auto *state = static_cast<UfsecpMetalBatchState *>(state_handle);
     if (!state || !g_runtime) return -1;
 
-    EnsureGenLutBuilt();
+    // LUT is built eagerly in UfsecpMetalEnsureReady (called from Bind on a
+    // single thread), so it's already published by the time any worker reaches
+    // here. Defensive check only.
     if (!g_lut_available) return -1;
 
     // Pass 1: phases 1-5
@@ -583,7 +585,7 @@ int UfsecpMetalRunKernelsFull(void *state_handle, uint8_t *match_flags, uint32_t
         if (tg == 0) tg = 128;
         std::vector<mtl::MetalBuffer *> bufs = {
             &state->tweak_buf, &state->scan_plan_buf,
-            &g_gen_lut_buf, &g_spend_buf,
+            &g_gen_lut_buf, &state->spend_buf,
             &state->midstate_buf,
             &state->cand_x_buf, &state->cand_z_buf,
             &state->output_pts_buf, &state->count_buf
@@ -597,7 +599,7 @@ int UfsecpMetalRunKernelsFull(void *state_handle, uint8_t *match_flags, uint32_t
         uint32_t tg = 256;
         std::vector<mtl::MetalBuffer *> bufs = {
             &state->cand_x_buf, &state->cand_z_buf,
-            &state->output_pts_buf, &g_spend_buf,
+            &state->output_pts_buf, &state->spend_buf,
             &state->output_prefixes_buf, &state->output_offsets_buf,
             &state->output_lengths_buf, &state->match_flags_buf,
             &state->count_buf
