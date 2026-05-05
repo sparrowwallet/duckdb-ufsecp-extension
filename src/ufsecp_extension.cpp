@@ -105,16 +105,13 @@ static int g_num_gpus = 0;
 static bool g_gpu_detected = false;
 static std::mutex g_gpu_init_mutex;
 
-// Function pointers for the active GPU backend — full pipeline (phases 1-6)
-// Old API (CUDA/OpenCL): separate SetSpendKey upload + LaunchBatchFull
-static void (*g_gpu_set_spend)(const uint8_t *, int, const uint8_t *, int) = nullptr;
-static void *(*g_gpu_launch_full)(const uint8_t *, const int64_t *, uint32_t, const uint32_t *, const uint8_t *,
-                                  uint32_t, int, const void *) = nullptr;
-// New API (Metal): spend bytes passed inline, no global; eager init replaces lazy LUT build
+// Function pointers for the active GPU backend — full pipeline (phases 1-6).
+// Spend bytes are passed inline through LaunchBatchFull (per-batch); LUT-style
+// state is built eagerly via EnsureReady (called once per Bind, before any
+// worker thread runs).
 static void (*g_gpu_ensure_ready)() = nullptr;
-static void *(*g_gpu_launch_full_with_spend)(const uint8_t *, const int64_t *, uint32_t, const uint32_t *,
-                                             const uint8_t *, uint32_t, int, const void *, const uint8_t *, int,
-                                             const uint8_t *) = nullptr;
+static void *(*g_gpu_launch_full)(const uint8_t *, const int64_t *, uint32_t, const uint32_t *, const uint8_t *,
+                                  uint32_t, int, const void *, const uint8_t *, int, const uint8_t *) = nullptr;
 static int (*g_gpu_run_full)(void *, uint8_t *, uint32_t) = nullptr;
 
 // Function pointers for the active GPU backend — legacy (phases 1-4, fallback)
@@ -137,7 +134,7 @@ static void EnsureGpuDetected() {
 		if (cuda_gpus > 0) {
 			g_num_gpus = cuda_gpus;
 			g_gpu_backend = GpuBackend::CUDA;
-			g_gpu_launch_full_with_spend = UfsecpCudaLaunchBatchFull;
+			g_gpu_launch_full = UfsecpCudaLaunchBatchFull;
 			g_gpu_run_full = UfsecpCudaRunKernelsFull;
 			g_gpu_launch = UfsecpCudaLaunchBatch;
 			g_gpu_run = UfsecpCudaRunKernels;
@@ -155,7 +152,7 @@ static void EnsureGpuDetected() {
 			g_num_gpus = ocl_gpus;
 			g_gpu_backend = GpuBackend::OPENCL;
 			g_gpu_ensure_ready = UfsecpOclEnsureReady;
-			g_gpu_launch_full_with_spend = UfsecpOclLaunchBatchFull;
+			g_gpu_launch_full = UfsecpOclLaunchBatchFull;
 			g_gpu_run_full = UfsecpOclRunKernelsFull;
 			g_gpu_launch = UfsecpOclLaunchBatch;
 			g_gpu_run = UfsecpOclRunKernels;
@@ -173,7 +170,7 @@ static void EnsureGpuDetected() {
 			g_num_gpus = metal_gpus;
 			g_gpu_backend = GpuBackend::METAL;
 			g_gpu_ensure_ready = UfsecpMetalEnsureReady;
-			g_gpu_launch_full_with_spend = UfsecpMetalLaunchBatchFull;
+			g_gpu_launch_full = UfsecpMetalLaunchBatchFull;
 			g_gpu_run_full = UfsecpMetalRunKernelsFull;
 			g_gpu_launch = UfsecpMetalLaunchBatch;
 			g_gpu_run = UfsecpMetalRunKernels;
@@ -313,10 +310,6 @@ struct UfsecpScanLocalState : public LocalTableFunctionState {
 struct UfsecpScanState : public GlobalTableFunctionState {
 	UfsecpScanState() {
 	}
-
-	// GPU spend key uploaded flag (legacy CUDA/OpenCL path that still uses a
-	// process-global spend buffer; new Metal path passes spend bytes inline)
-	std::atomic<bool> spend_key_uploaded {false};
 };
 
 // ============================================================================
@@ -587,15 +580,6 @@ static void ProcessBatchGpu(UfsecpScanLocalState &local_state, const UfsecpScanB
 	}
 	const uint8_t *label_ptr = label_buf.empty() ? nullptr : label_buf.data();
 
-	// Old API: upload spend key once per query via SetSpendKey (CUDA/OpenCL).
-	// New API (g_gpu_launch_full_with_spend) passes spend bytes inline, no global upload needed.
-	if (g_gpu_set_spend && !global_state.spend_key_uploaded) {
-		for (int gpu = 0; gpu < g_num_gpus; gpu++) {
-			g_gpu_set_spend(spend_xy, num_labels, label_ptr, gpu);
-		}
-		global_state.spend_key_uploaded = true;
-	}
-
 	// Marshal tweak keys into contiguous buffer (N × 64 bytes, already LE)
 	std::vector<uint8_t> tweak_buf(N * 64);
 	for (idx_t i = 0; i < N; i++) {
@@ -607,7 +591,7 @@ static void ProcessBatchGpu(UfsecpScanLocalState &local_state, const UfsecpScanB
 	// ====================================================================
 	// Try full pipeline (phases 1-6 on GPU)
 	// ====================================================================
-	if (g_gpu_launch_full_with_spend || g_gpu_launch_full) {
+	if (g_gpu_launch_full) {
 		// Marshal output offsets and lengths
 		std::vector<uint32_t> output_offsets(N);
 		std::vector<uint8_t> output_lengths(N);
@@ -617,17 +601,9 @@ static void ProcessBatchGpu(UfsecpScanLocalState &local_state, const UfsecpScanB
 		}
 		uint32_t total_outputs = static_cast<uint32_t>(local_state.accumulated_outputs.size());
 
-		void *gpu_state = nullptr;
-		if (g_gpu_launch_full_with_spend) {
-			gpu_state =
-			    g_gpu_launch_full_with_spend(tweak_buf.data(), local_state.accumulated_outputs.data(), total_outputs,
-			                                 output_offsets.data(), output_lengths.data(), static_cast<uint32_t>(N),
-			                                 local_state.assigned_gpu, &scan_glv, spend_xy, num_labels, label_ptr);
-		} else {
-			gpu_state = g_gpu_launch_full(tweak_buf.data(), local_state.accumulated_outputs.data(), total_outputs,
-			                              output_offsets.data(), output_lengths.data(), static_cast<uint32_t>(N),
-			                              local_state.assigned_gpu, &scan_glv);
-		}
+		void *gpu_state = g_gpu_launch_full(tweak_buf.data(), local_state.accumulated_outputs.data(), total_outputs,
+		                                    output_offsets.data(), output_lengths.data(), static_cast<uint32_t>(N),
+		                                    local_state.assigned_gpu, &scan_glv, spend_xy, num_labels, label_ptr);
 
 		if (gpu_state) {
 			std::vector<uint8_t> match_flags(N);
