@@ -43,10 +43,10 @@ static std::unordered_map<std::string, std::shared_ptr<ScanProgress>> g_progress
 #ifdef UFSECP_CUDA_ENABLED
 extern "C" {
 int UfsecpCudaDetect(int *num_gpus);
-void UfsecpCudaSetSpendKey(const uint8_t *spend_xy, int num_labels, const uint8_t *label_keys_xy, int device_id);
 void *UfsecpCudaLaunchBatchFull(const uint8_t *tweak_data, const int64_t *output_prefixes, uint32_t total_outputs,
                                 const uint32_t *output_offsets, const uint8_t *output_lengths, uint32_t count,
-                                int device_id, const void *precomp);
+                                int device_id, const void *precomp, const uint8_t *spend_xy, int num_labels,
+                                const uint8_t *label_keys_xy);
 int UfsecpCudaRunKernelsFull(void *state_handle, uint8_t *match_flags, uint32_t count);
 void *UfsecpCudaLaunchBatch(const uint8_t *scan_key, const uint8_t *tweak_data, uint32_t count, int device_id,
                             const void *precomp);
@@ -137,8 +137,7 @@ static void EnsureGpuDetected() {
 		if (cuda_gpus > 0) {
 			g_num_gpus = cuda_gpus;
 			g_gpu_backend = GpuBackend::CUDA;
-			g_gpu_set_spend = UfsecpCudaSetSpendKey;
-			g_gpu_launch_full = UfsecpCudaLaunchBatchFull;
+			g_gpu_launch_full_with_spend = UfsecpCudaLaunchBatchFull;
 			g_gpu_run_full = UfsecpCudaRunKernelsFull;
 			g_gpu_launch = UfsecpCudaLaunchBatch;
 			g_gpu_run = UfsecpCudaRunKernels;

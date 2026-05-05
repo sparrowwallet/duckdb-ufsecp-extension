@@ -35,7 +35,11 @@ __device__ __constant__ static uint32_t BIP352_MIDSTATE[8] = {
 };
 
 // ============================================================================
-// Predecomposed scan key in __constant__ memory
+// Predecomposed scan key — per-batch (passed by value to kernels). Living in
+// a process-global __constant__ would be racy under concurrent scans with
+// different scan keys, so the bytes travel with the per-batch state instead.
+// 262 bytes; bundled with BIP352SpendKeys (1092 B) it fits in the 4 KB
+// kernel-parameter limit on sm_70+ with room to spare.
 // ============================================================================
 
 struct BIP352ScanKeyWnaf {
@@ -45,10 +49,11 @@ struct BIP352ScanKeyWnaf {
     uint8_t flip_phi;
 };
 
-__constant__ static BIP352ScanKeyWnaf g_scan_wnaf;
-
 // ============================================================================
-// Spend key + label keys in __constant__ memory
+// Spend key + label keys — per-batch (passed by value to kernels). Living in
+// a process-global __constant__ would be racy under concurrent scans with
+// different keys, so the bytes travel with the per-batch state instead.
+// 1092 bytes, well under the 4 KB kernel-parameter limit on sm_70+.
 // ============================================================================
 
 static constexpr int MAX_LABEL_KEYS = 16;
@@ -59,8 +64,6 @@ struct BIP352SpendKeys {
     uint8_t num_labels;
 };
 
-__constant__ static BIP352SpendKeys g_spend;
-
 // ============================================================================
 // Predecomp scalar multiply
 // ============================================================================
@@ -68,13 +71,14 @@ __constant__ static BIP352SpendKeys g_spend;
 static constexpr int WNAF_TABLE_SIZE = 8;
 
 __device__ inline void scalar_mul_predecomp(
-    const JacobianPoint* p, JacobianPoint* r)
+    const JacobianPoint* p, JacobianPoint* r,
+    const BIP352ScanKeyWnaf& scan_wnaf)
 {
     AffinePoint base;
     base.x = p->x;
     base.y = p->y;
 
-    if (g_scan_wnaf.k1_neg) {
+    if (scan_wnaf.k1_neg) {
         field_negate(&base.y, &base.y);
     }
 
@@ -83,7 +87,7 @@ __device__ inline void scalar_mul_predecomp(
     build_wnaf_table_zr(&base, tbl_P, WNAF_TABLE_SIZE, &globalz);
 
     AffinePoint tbl_phiP[WNAF_TABLE_SIZE];
-    derive_endo_table(tbl_P, tbl_phiP, WNAF_TABLE_SIZE, g_scan_wnaf.flip_phi != 0);
+    derive_endo_table(tbl_P, tbl_phiP, WNAF_TABLE_SIZE, scan_wnaf.flip_phi != 0);
 
     r->infinity = true;
     field_set_zero(&r->x);
@@ -94,7 +98,7 @@ __device__ inline void scalar_mul_predecomp(
     for (int i = 129; i >= 0; --i) {
         if (!r->infinity) jacobian_double_unchecked(r, r);
 
-        int8_t d1 = g_scan_wnaf.wnaf1[i];
+        int8_t d1 = scan_wnaf.wnaf1[i];
         if (d1 != 0) {
             int idx = (((d1 > 0) ? d1 : -d1) - 1) >> 1;
             AffinePoint pt = tbl_P[idx];
@@ -107,7 +111,7 @@ __device__ inline void scalar_mul_predecomp(
             }
         }
 
-        int8_t d2 = g_scan_wnaf.wnaf2[i];
+        int8_t d2 = scan_wnaf.wnaf2[i];
         if (d2 != 0) {
             int idx = (((d2 > 0) ? d2 : -d2) - 1) >> 1;
             AffinePoint pt = tbl_phiP[idx];
@@ -358,6 +362,9 @@ struct UfsecpGpuBatchState {
     // Fallback buffers (phases 1-4 only)
     uint8_t* d_output_x;
     uint8_t* d_output_y;
+    // Per-batch scan-key wNAF plan + spend keys (passed by value to kernels)
+    BIP352ScanKeyWnaf h_scan_wnaf;
+    BIP352SpendKeys h_spend_keys;
     uint32_t count;
     cudaStream_t stream;
     int device_id;
@@ -370,7 +377,8 @@ struct UfsecpGpuBatchState {
 
 __device__ inline void bip352_phases_1_3(
     const uint8_t* tweak, JacobianPoint* shared_point,
-    uint8_t serialized[37])
+    uint8_t serialized[37],
+    const BIP352ScanKeyWnaf& scan_wnaf)
 {
     FieldElement fx, fy;
     for (int i = 0; i < 4; i++) {
@@ -390,7 +398,7 @@ __device__ inline void bip352_phases_1_3(
     tweak_point.infinity = false;
 
     // Phase 1
-    scalar_mul_predecomp(&tweak_point, shared_point);
+    scalar_mul_predecomp(&tweak_point, shared_point, scan_wnaf);
 
     // Phase 2
     FieldElement z_inv, z_inv2, z_inv3, x_aff, y_aff;
@@ -437,6 +445,8 @@ __global__ void BIP352FullPass1(
     FieldElement* __restrict__ cand_x,      // candidate.x for base spend key
     FieldElement* __restrict__ cand_z,      // candidate.z → batch inverted in pass 2
     JacobianPoint* __restrict__ output_pts, // output points for label processing (may be null)
+    BIP352ScanKeyWnaf scan_wnaf,            // per-batch (by value) — see header note
+    BIP352SpendKeys spend_keys,             // per-batch (by value) — see header note
     uint32_t count)
 {
     uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -444,7 +454,7 @@ __global__ void BIP352FullPass1(
 
     JacobianPoint shared_point;
     uint8_t serialized[37];
-    bip352_phases_1_3(tweak_xy + idx * 64, &shared_point, serialized);
+    bip352_phases_1_3(tweak_xy + idx * 64, &shared_point, serialized, scan_wnaf);
 
     uint8_t hash[32];
     bip352_phase_3_hash(serialized, hash);
@@ -456,7 +466,7 @@ __global__ void BIP352FullPass1(
 
     // Phase 5: candidate = output_point + spend_key
     JacobianPoint candidate;
-    jacobian_add_mixed_unchecked(&output_point, &g_spend.base, &candidate);
+    jacobian_add_mixed_unchecked(&output_point, &spend_keys.base, &candidate);
 
     cand_x[idx] = candidate.x;
     cand_z[idx] = candidate.z;
@@ -525,6 +535,7 @@ __global__ __launch_bounds__(256, 4) void BIP352BatchInvMatchKernel(
     const uint32_t* __restrict__ output_offsets,
     const uint8_t* __restrict__ output_lengths,
     uint8_t* __restrict__ match_flags,
+    BIP352SpendKeys spend_keys,             // per-batch (by value)
     uint32_t count)
 {
     using namespace secp256k1::cuda;
@@ -567,12 +578,12 @@ __global__ __launch_bounds__(256, 4) void BIP352BatchInvMatchKernel(
 
     // === Rounds 2+: label keys (batch-invert label candidate Z) ===
     if (output_pts) {
-        for (uint8_t lbl = 0; lbl < g_spend.num_labels; lbl++) {
+        for (uint8_t lbl = 0; lbl < spend_keys.num_labels; lbl++) {
             // Compute label candidate and extract its Z
             FieldElement label_z, label_x;
             if (valid) {
                 JacobianPoint label_cand;
-                jacobian_add_mixed_unchecked(&output_pts[idx], &g_spend.labels[lbl], &label_cand);
+                jacobian_add_mixed_unchecked(&output_pts[idx], &spend_keys.labels[lbl], &label_cand);
                 label_x = label_cand.x;
                 label_z = label_cand.z;
             } else {
@@ -604,6 +615,7 @@ __global__ void BIP352FusedKernelLUT(
     uint8_t* __restrict__ out_x,
     uint8_t* __restrict__ out_y,
     const AffinePoint* __restrict__ gen_lut,
+    BIP352ScanKeyWnaf scan_wnaf,
     uint32_t count)
 {
     uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -611,7 +623,7 @@ __global__ void BIP352FusedKernelLUT(
 
     JacobianPoint shared_point;
     uint8_t serialized[37];
-    bip352_phases_1_3(tweak_xy + idx * 64, &shared_point, serialized);
+    bip352_phases_1_3(tweak_xy + idx * 64, &shared_point, serialized, scan_wnaf);
 
     uint8_t hash[32];
     bip352_phase_3_hash(serialized, hash);
@@ -639,6 +651,7 @@ __global__ void BIP352FusedKernel(
     const uint8_t* __restrict__ tweak_xy,
     uint8_t* __restrict__ out_x,
     uint8_t* __restrict__ out_y,
+    BIP352ScanKeyWnaf scan_wnaf,
     uint32_t count)
 {
     uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -646,7 +659,7 @@ __global__ void BIP352FusedKernel(
 
     JacobianPoint shared_point;
     uint8_t serialized[37];
-    bip352_phases_1_3(tweak_xy + idx * 64, &shared_point, serialized);
+    bip352_phases_1_3(tweak_xy + idx * 64, &shared_point, serialized, scan_wnaf);
 
     uint8_t hash[32];
     bip352_phase_3_hash(serialized, hash);
@@ -682,12 +695,12 @@ int UfsecpCudaDetect(int* num_gpus) {
     return 0;
 }
 
-// Upload spend key + labels to __constant__ (once per query)
-void UfsecpCudaSetSpendKey(const uint8_t* spend_xy, int num_labels,
-                           const uint8_t* label_keys_xy, int device_id) {
-    cudaSetDevice(device_id);
-
-    BIP352SpendKeys h_spend = {};
+// Convert 64-byte LE spend/label bytes (Frigate wire format) into the host
+// BIP352SpendKeys layout that the kernel expects (per-batch).
+static void BuildSpendKeys(const uint8_t* spend_xy, int num_labels,
+                           const uint8_t* label_keys_xy,
+                           BIP352SpendKeys& out) {
+    out = {};
 
     // spend_xy: 64 LE bytes (32 x + 32 y) → AffinePoint (4×u64 LE limbs)
     for (int i = 0; i < 4; i++) {
@@ -696,12 +709,12 @@ void UfsecpCudaSetSpendKey(const uint8_t* spend_xy, int num_labels,
             xv |= (uint64_t)spend_xy[i * 8 + j] << (j * 8);
             yv |= (uint64_t)spend_xy[32 + i * 8 + j] << (j * 8);
         }
-        h_spend.base.x.limbs[i] = xv;
-        h_spend.base.y.limbs[i] = yv;
+        out.base.x.limbs[i] = xv;
+        out.base.y.limbs[i] = yv;
     }
 
     int n = (num_labels > MAX_LABEL_KEYS) ? MAX_LABEL_KEYS : num_labels;
-    h_spend.num_labels = (uint8_t)n;
+    out.num_labels = (uint8_t)n;
     for (int L = 0; L < n; L++) {
         const uint8_t* lxy = label_keys_xy + L * 64;
         for (int i = 0; i < 4; i++) {
@@ -710,33 +723,34 @@ void UfsecpCudaSetSpendKey(const uint8_t* spend_xy, int num_labels,
                 xv |= (uint64_t)lxy[i * 8 + j] << (j * 8);
                 yv |= (uint64_t)lxy[32 + i * 8 + j] << (j * 8);
             }
-            h_spend.labels[L].x.limbs[i] = xv;
-            h_spend.labels[L].y.limbs[i] = yv;
+            out.labels[L].x.limbs[i] = xv;
+            out.labels[L].y.limbs[i] = yv;
         }
     }
-
-    cudaMemcpyToSymbol(g_spend, &h_spend, sizeof(BIP352SpendKeys));
 }
 
-// Full pipeline launch: upload tweaks + output prefix data
+// Full pipeline launch: upload tweaks + output prefix data + per-batch spend
 void* UfsecpCudaLaunchBatchFull(
     const uint8_t* tweak_data,
     const int64_t* output_prefixes, uint32_t total_outputs,
     const uint32_t* output_offsets,
     const uint8_t* output_lengths,
     uint32_t count, int device_id,
-    const void* precomp)
+    const void* precomp,
+    const uint8_t* spend_xy, int num_labels,
+    const uint8_t* label_keys_xy)
 {
     cudaError_t err = cudaSetDevice(device_id);
     if (err != cudaSuccess) return nullptr;
-
-    if (precomp)
-        cudaMemcpyToSymbol(g_scan_wnaf, precomp, sizeof(BIP352ScanKeyWnaf));
 
     auto* state = new UfsecpGpuBatchState();
     state->count = count;
     state->device_id = device_id;
     state->full_pipeline = true;
+    if (precomp)
+        std::memcpy(&state->h_scan_wnaf, precomp, sizeof(BIP352ScanKeyWnaf));
+    else
+        std::memset(&state->h_scan_wnaf, 0, sizeof(BIP352ScanKeyWnaf));
     state->d_tweak_xy = nullptr;
     state->d_output_prefixes = nullptr;
     state->d_output_offsets = nullptr;
@@ -747,6 +761,10 @@ void* UfsecpCudaLaunchBatchFull(
     state->d_output_pts = nullptr;
     state->d_output_x = nullptr;
     state->d_output_y = nullptr;
+
+    // Per-batch spend keys (no global, so concurrent scans with different keys
+    // don't race on a shared __constant__).
+    BuildSpendKeys(spend_xy, num_labels, label_keys_xy, state->h_spend_keys);
 
     err = cudaStreamCreate(&state->stream);
     if (err != cudaSuccess) { delete state; return nullptr; }
@@ -823,7 +841,8 @@ int UfsecpCudaRunKernelsFull(void* state_handle, uint8_t* match_flags, uint32_t 
     // Pass 1: phases 1-4 + add spend key → store candidate X/Z + output points
     BIP352FullPass1<<<blocks, threads, 0, state->stream>>>(
         state->d_tweak_xy, lut,
-        state->d_cand_x, state->d_cand_z, state->d_output_pts, count);
+        state->d_cand_x, state->d_cand_z, state->d_output_pts,
+        state->h_scan_wnaf, state->h_spend_keys, count);
 
     // Pass 2: fused batch inversion + prefix extraction + matching
     {
@@ -833,7 +852,7 @@ int UfsecpCudaRunKernelsFull(void* state_handle, uint8_t* match_flags, uint32_t 
         BIP352BatchInvMatchKernel<<<bi_blocks, bi_threads, shared_size, state->stream>>>(
             state->d_cand_x, state->d_cand_z, state->d_output_pts,
             state->d_output_prefixes, state->d_output_offsets, state->d_output_lengths,
-            state->d_match_flags, count);
+            state->d_match_flags, state->h_spend_keys, count);
     }
 
     cudaMemcpyAsync(match_flags, state->d_match_flags, (size_t)count,
@@ -856,13 +875,14 @@ void* UfsecpCudaLaunchBatch(
     cudaError_t err = cudaSetDevice(device_id);
     if (err != cudaSuccess) return nullptr;
 
-    if (precomp)
-        cudaMemcpyToSymbol(g_scan_wnaf, precomp, sizeof(BIP352ScanKeyWnaf));
-
     auto* state = new UfsecpGpuBatchState();
     state->count = count;
     state->device_id = device_id;
     state->full_pipeline = false;
+    if (precomp)
+        std::memcpy(&state->h_scan_wnaf, precomp, sizeof(BIP352ScanKeyWnaf));
+    else
+        std::memset(&state->h_scan_wnaf, 0, sizeof(BIP352ScanKeyWnaf));
     state->d_tweak_xy = nullptr;
     state->d_output_x = nullptr;
     state->d_output_y = nullptr;
@@ -917,10 +937,11 @@ int UfsecpCudaRunKernels(void* state_handle, uint8_t* out_x, uint8_t* out_y, uin
     if (lut) {
         BIP352FusedKernelLUT<<<blocks, threads, 0, state->stream>>>(
             state->d_tweak_xy, state->d_output_x, state->d_output_y,
-            lut, count);
+            lut, state->h_scan_wnaf, count);
     } else {
         BIP352FusedKernel<<<blocks, threads, 0, state->stream>>>(
-            state->d_tweak_xy, state->d_output_x, state->d_output_y, count);
+            state->d_tweak_xy, state->d_output_x, state->d_output_y,
+            state->h_scan_wnaf, count);
     }
 
     size_t point_size = (size_t)count * 32;
