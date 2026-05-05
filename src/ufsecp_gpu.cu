@@ -690,8 +690,21 @@ __global__ void BIP352FusedKernel(
 extern "C" {
 
 int UfsecpCudaDetect(int* num_gpus) {
-    cudaError_t err = cudaGetDeviceCount(num_gpus);
+    int total = 0;
+    cudaError_t err = cudaGetDeviceCount(&total);
     if (err != cudaSuccess) { *num_gpus = 0; return -1; }
+
+    // Kernels are compiled for sm_80+ (Ampere). If any visible device is older,
+    // report 0 so the caller falls through to OpenCL — otherwise launches on
+    // the unsupported device would fail with cudaErrorNoKernelImageForDevice.
+    for (int i = 0; i < total; i++) {
+        cudaDeviceProp prop;
+        if (cudaGetDeviceProperties(&prop, i) != cudaSuccess || prop.major < 8) {
+            *num_gpus = 0;
+            return 0;
+        }
+    }
+    *num_gpus = total;
     return 0;
 }
 
