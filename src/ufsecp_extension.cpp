@@ -57,10 +57,11 @@ void UfsecpCudaFreeBatch(void *state_handle);
 #ifdef UFSECP_OPENCL_ENABLED
 extern "C" {
 int UfsecpOclDetect(int *num_gpus);
-void UfsecpOclSetSpendKey(const uint8_t *spend_xy, int num_labels, const uint8_t *label_keys_xy, int device_id);
+void UfsecpOclEnsureReady();
 void *UfsecpOclLaunchBatchFull(const uint8_t *tweak_data, const int64_t *output_prefixes, uint32_t total_outputs,
                                const uint32_t *output_offsets, const uint8_t *output_lengths, uint32_t count,
-                               int device_id, const void *precomp);
+                               int device_id, const void *precomp, const uint8_t *spend_xy, int num_labels,
+                               const uint8_t *label_keys_xy);
 int UfsecpOclRunKernelsFull(void *state_handle, uint8_t *match_flags, uint32_t count);
 void *UfsecpOclLaunchBatch(const uint8_t *scan_key, const uint8_t *tweak_data, uint32_t count, int device_id,
                            const void *precomp);
@@ -154,8 +155,8 @@ static void EnsureGpuDetected() {
 		if (ocl_gpus > 0) {
 			g_num_gpus = ocl_gpus;
 			g_gpu_backend = GpuBackend::OPENCL;
-			g_gpu_set_spend = UfsecpOclSetSpendKey;
-			g_gpu_launch_full = UfsecpOclLaunchBatchFull;
+			g_gpu_ensure_ready = UfsecpOclEnsureReady;
+			g_gpu_launch_full_with_spend = UfsecpOclLaunchBatchFull;
 			g_gpu_run_full = UfsecpOclRunKernelsFull;
 			g_gpu_launch = UfsecpOclLaunchBatch;
 			g_gpu_run = UfsecpOclRunKernels;

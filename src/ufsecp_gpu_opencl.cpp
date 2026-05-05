@@ -48,16 +48,17 @@ static cl_mem g_ocl_gen_lut = nullptr;
 static bool g_ocl_lut_built = false;
 static std::mutex g_ocl_lut_mutex;
 
-// Spend key (uploaded once per query)
-static cl_mem g_ocl_spend_buf = nullptr;
+// Spend key buffer is per-batch (in UfsecpOclBatchState), not global, since
+// concurrent scans may carry different keys.
 
 // ============================================================================
 // Generator LUT construction
 // ============================================================================
 
 static void EnsureOclGenLutBuilt() {
-	if (g_ocl_lut_built)
-		return;
+	// No fast-path early-return: the flag is non-atomic and ARM may reorder
+	// its visibility relative to g_ocl_gen_lut. Always take the mutex.
+	// After first build the lock is uncontended; cost is negligible.
 	std::lock_guard<std::mutex> lock(g_ocl_lut_mutex);
 	if (g_ocl_lut_built)
 		return;
@@ -140,6 +141,7 @@ struct UfsecpOclBatchState {
 	cl_mem out_x_buf;
 	cl_mem out_y_buf;
 	// Full pipeline (phases 1-6)
+	cl_mem spend_buf;
 	cl_mem output_prefixes_buf;
 	cl_mem output_offsets_buf;
 	cl_mem output_lengths_buf;
@@ -307,38 +309,21 @@ int UfsecpOclDetect(int *num_gpus) {
 	return 0;
 }
 
-// Upload spend key + labels (once per query)
-void UfsecpOclSetSpendKey(const uint8_t *spend_xy, int num_labels, const uint8_t *label_keys_xy, int device_id) {
-	(void)device_id;
-	if (!g_ocl_ctx)
+// Eager backend init: build the LUT on the bind thread before any worker
+// runs. The LUT depends only on the curve (not on per-scan keys), so it is
+// safe to build once per process.
+void UfsecpOclEnsureReady() {
+	if (!g_ocl_ctx || g_ocl_device_count == 0)
 		return;
-
-	auto *ctx = static_cast<cl_context>(g_ocl_ctx->native_context());
-
-	// BIP352SpendKeys: AffinePoint base + AffinePoint[16] labels + u8 num_labels + u8[3] pad
-	// AffinePoint = 64 bytes, total = 64 + 16*64 + 4 = 1092 bytes
-	static constexpr size_t SPEND_SIZE = 64 + 16 * 64 + 4;
-	uint8_t spend_data[SPEND_SIZE] = {};
-
-	// base (64 LE bytes, already in wire format)
-	std::memcpy(spend_data, spend_xy, 64);
-
-	int n = (num_labels > 16) ? 16 : num_labels;
-	if (label_keys_xy && n > 0)
-		std::memcpy(spend_data + 64, label_keys_xy, n * 64);
-
-	spend_data[64 + 16 * 64] = (uint8_t)n; // num_labels
-
-	if (g_ocl_spend_buf)
-		clReleaseMemObject(g_ocl_spend_buf);
-	cl_int err;
-	g_ocl_spend_buf = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, SPEND_SIZE, spend_data, &err);
+	if (g_use_lut)
+		EnsureOclGenLutBuilt();
 }
 
 // Full pipeline launch
 void *UfsecpOclLaunchBatchFull(const uint8_t *tweak_data, const int64_t *output_prefixes, uint32_t total_outputs,
                                const uint32_t *output_offsets, const uint8_t *output_lengths, uint32_t count,
-                               int device_id, const void *precomp) {
+                               int device_id, const void *precomp, const uint8_t *spend_xy, int num_labels,
+                               const uint8_t *label_keys_xy) {
 	(void)device_id;
 	if (!g_ocl_ctx || !g_ocl_ctx->is_valid() || !g_use_full)
 		return nullptr;
@@ -352,6 +337,7 @@ void *UfsecpOclLaunchBatchFull(const uint8_t *tweak_data, const int64_t *output_
 	state->full_pipeline = true;
 	state->out_x_buf = nullptr;
 	state->out_y_buf = nullptr;
+	state->spend_buf = nullptr;
 
 	state->tweak_buf = clCreateBuffer(ctx_cl, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, count * 64,
 	                                  const_cast<uint8_t *>(tweak_data), &err);
@@ -364,6 +350,23 @@ void *UfsecpOclLaunchBatchFull(const uint8_t *tweak_data, const int64_t *output_
 	    clCreateBuffer(ctx_cl, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, 264, const_cast<void *>(precomp), &err);
 	if (err != CL_SUCCESS)
 		goto fail;
+
+	// Spend key + labels (per-batch, so concurrent scans with different keys
+	// do not race on a shared global).
+	// BIP352SpendKeys: base(64) + labels[16](1024) + num_labels(1) + pad(3) = 1092
+	{
+		static constexpr size_t SPEND_SIZE = 64 + 16 * 64 + 4;
+		uint8_t spend_data[SPEND_SIZE] = {};
+		std::memcpy(spend_data, spend_xy, 64);
+		int n = (num_labels > 16) ? 16 : num_labels;
+		if (label_keys_xy && n > 0)
+			std::memcpy(spend_data + 64, label_keys_xy, (size_t)n * 64);
+		spend_data[64 + 16 * 64] = (uint8_t)n;
+		state->spend_buf =
+		    clCreateBuffer(ctx_cl, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, SPEND_SIZE, spend_data, &err);
+		if (err != CL_SUCCESS)
+			goto fail;
+	}
 
 	state->output_prefixes_buf =
 	    clCreateBuffer(ctx_cl, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, (size_t)total_outputs * sizeof(int64_t),
@@ -411,6 +414,8 @@ fail:
 		clReleaseMemObject(state->tweak_buf);
 	if (state->scan_plan_buf)
 		clReleaseMemObject(state->scan_plan_buf);
+	if (state->spend_buf)
+		clReleaseMemObject(state->spend_buf);
 	if (state->output_prefixes_buf)
 		clReleaseMemObject(state->output_prefixes_buf);
 	if (state->output_offsets_buf)
@@ -431,13 +436,14 @@ fail:
 
 int UfsecpOclRunKernelsFull(void *state_handle, uint8_t *match_flags, uint32_t count) {
 	auto *state = static_cast<UfsecpOclBatchState *>(state_handle);
-	if (!state || !g_ocl_ctx || !g_ocl_spend_buf)
+	if (!state || !g_ocl_ctx || !state->spend_buf)
 		return -1;
 
 	auto *queue = static_cast<cl_command_queue>(g_ocl_ctx->native_queue());
 
-	if (g_use_lut)
-		EnsureOclGenLutBuilt();
+	// LUT is built eagerly in UfsecpOclEnsureReady (called from Bind on a
+	// single thread), so it's already published by the time any worker reaches
+	// here. Defensive check only.
 	if (!g_ocl_gen_lut)
 		return -1;
 
@@ -449,7 +455,7 @@ int UfsecpOclRunKernelsFull(void *state_handle, uint8_t *match_flags, uint32_t c
 		clSetKernelArg(k, 0, sizeof(cl_mem), &state->tweak_buf);
 		clSetKernelArg(k, 1, sizeof(cl_mem), &state->scan_plan_buf);
 		clSetKernelArg(k, 2, sizeof(cl_mem), &g_ocl_gen_lut);
-		clSetKernelArg(k, 3, sizeof(cl_mem), &g_ocl_spend_buf);
+		clSetKernelArg(k, 3, sizeof(cl_mem), &state->spend_buf);
 		clSetKernelArg(k, 4, sizeof(cl_mem), &state->cand_x_buf);
 		clSetKernelArg(k, 5, sizeof(cl_mem), &state->cand_z_buf);
 		clSetKernelArg(k, 6, sizeof(cl_mem), &state->output_pts_buf);
@@ -469,7 +475,7 @@ int UfsecpOclRunKernelsFull(void *state_handle, uint8_t *match_flags, uint32_t c
 		clSetKernelArg(k, 0, sizeof(cl_mem), &state->cand_x_buf);
 		clSetKernelArg(k, 1, sizeof(cl_mem), &state->cand_z_buf);
 		clSetKernelArg(k, 2, sizeof(cl_mem), &state->output_pts_buf);
-		clSetKernelArg(k, 3, sizeof(cl_mem), &g_ocl_spend_buf);
+		clSetKernelArg(k, 3, sizeof(cl_mem), &state->spend_buf);
 		clSetKernelArg(k, 4, sizeof(cl_mem), &state->output_prefixes_buf);
 		clSetKernelArg(k, 5, sizeof(cl_mem), &state->output_offsets_buf);
 		clSetKernelArg(k, 6, sizeof(cl_mem), &state->output_lengths_buf);
@@ -505,6 +511,7 @@ void *UfsecpOclLaunchBatch(const uint8_t *scan_key, const uint8_t *tweak_data, u
 	state->count = count;
 	state->use_fused = g_use_fused;
 	state->full_pipeline = false;
+	state->spend_buf = nullptr;
 	state->output_prefixes_buf = nullptr;
 	state->output_offsets_buf = nullptr;
 	state->output_lengths_buf = nullptr;
@@ -570,8 +577,7 @@ int UfsecpOclRunKernels(void *state_handle, uint8_t *out_x, uint8_t *out_y, uint
 
 	if (state->use_fused) {
 		auto *queue = static_cast<cl_command_queue>(g_ocl_ctx->native_queue());
-		if (g_use_lut)
-			EnsureOclGenLutBuilt();
+		// LUT is built eagerly in UfsecpOclEnsureReady (called from Bind).
 
 		std::lock_guard<std::mutex> lock(g_ocl_mutex);
 
@@ -649,6 +655,8 @@ void UfsecpOclFreeBatch(void *state_handle) {
 		clReleaseMemObject(state->out_x_buf);
 	if (state->out_y_buf)
 		clReleaseMemObject(state->out_y_buf);
+	if (state->spend_buf)
+		clReleaseMemObject(state->spend_buf);
 	if (state->output_prefixes_buf)
 		clReleaseMemObject(state->output_prefixes_buf);
 	if (state->output_offsets_buf)
