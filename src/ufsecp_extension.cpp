@@ -33,6 +33,15 @@
 struct ScanProgress {
 	std::atomic<uint64_t> rows_received {0};
 	std::atomic<uint64_t> rows_processed {0};
+	// Optional caller-supplied row total for the input subquery (set via the
+	// `total_rows` named parameter on ufsecp_scan). When set (>0),
+	// ufsecp_progress reports `received / total_rows`, which advances
+	// per-chunk (smooth) instead of per-batch (granular). When 0, falls
+	// back to processed/received, which jumps in batch_size increments.
+	uint64_t total_rows {0};
+	// `complete` is consulted by ufsecp_progress() only in the empty-scan
+	// case (received stays 0). For non-empty scans, total_rows (if set) or
+	// processed/received is the authoritative progress signal.
 	std::atomic<bool> complete {false};
 };
 
@@ -227,7 +236,7 @@ static int64_t ExtractUpper64(const FieldElement &fe) {
 // ============================================================================
 
 struct UfsecpScanBindData : public TableFunctionData {
-	UfsecpScanBindData() : batch_size(300000) {
+	UfsecpScanBindData() : batch_size(300000), total_rows(0) {
 	}
 	~UfsecpScanBindData() {
 		if (progress) {
@@ -240,6 +249,12 @@ struct UfsecpScanBindData : public TableFunctionData {
 	static constexpr idx_t SCALAR_SIZE = 32;    // 32 bytes: scalar for EC multiplication
 
 	idx_t batch_size;
+	// Caller-supplied row count for the input subquery (named parameter
+	// total_rows, default 0 = "not provided"). When set, ufsecp_progress
+	// reports received/total_rows for smooth per-chunk granularity. The
+	// caller should pass `SELECT COUNT(*) FROM <same_input>` — i.e. with
+	// the same WHERE filter that the scan's input subquery uses.
+	idx_t total_rows;
 
 	// Precomputed at bind time from scan_private_key
 	KPlan kplan;
@@ -798,6 +813,25 @@ static unique_ptr<FunctionData> UfsecpScanBind(ClientContext &context, TableFunc
 		batch_size = static_cast<idx_t>(bs_int);
 	}
 
+	// --- Parse optional total_rows named parameter ---
+	// When provided, used as the denominator for ufsecp_progress() so that
+	// progress advances per-input-chunk (smooth) rather than per-batch
+	// (granular). Caller should pass `SELECT COUNT(*) FROM <same input>` so
+	// the total matches what the scan will actually consume.
+	idx_t total_rows = 0;
+	auto tr_entry = input.named_parameters.find("total_rows");
+	if (tr_entry != input.named_parameters.end()) {
+		auto &trv = tr_entry->second;
+		if (trv.type().id() != LogicalTypeId::INTEGER && trv.type().id() != LogicalTypeId::BIGINT) {
+			throw InvalidInputException("total_rows parameter must be an INTEGER");
+		}
+		int64_t tr_int = IntegerValue::Get(trv);
+		if (tr_int < 0) {
+			throw InvalidInputException("total_rows must be non-negative, got %lld", tr_int);
+		}
+		total_rows = static_cast<idx_t>(tr_int);
+	}
+
 	// --- Parse optional backend named parameter ---
 	std::string backend_str = "auto";
 	auto be_entry = input.named_parameters.find("backend");
@@ -823,6 +857,7 @@ static unique_ptr<FunctionData> UfsecpScanBind(ClientContext &context, TableFunc
 	// --- Build bind data with precomputed values ---
 	auto bind_data = make_uniq<UfsecpScanBindData>();
 	bind_data->batch_size = batch_size;
+	bind_data->total_rows = total_rows;
 	bind_data->backend = backend_str;
 
 	// Resolve backend
@@ -857,6 +892,7 @@ static unique_ptr<FunctionData> UfsecpScanBind(ClientContext &context, TableFunc
 
 	// Register progress entry for side-channel polling via ufsecp_progress()
 	bind_data->progress = std::make_shared<ScanProgress>();
+	bind_data->progress->total_rows = bind_data->total_rows;
 	{
 		std::lock_guard<std::mutex> lock(g_progress_mutex);
 		g_progress_map[bind_data->scan_private_key_data] = bind_data->progress;
@@ -1037,6 +1073,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	func.in_out_function_final = UfsecpScanFinalFunction;
 	func.named_parameters["batch_size"] = LogicalType::INTEGER;
 	func.named_parameters["backend"] = LogicalType::VARCHAR;
+	func.named_parameters["total_rows"] = LogicalType::BIGINT;
 	loader.RegisterFunction(func);
 
 	// ufsecp_set_cache_dir(path) — set precompute table cache directory
@@ -1092,38 +1129,47 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(backend_func);
 
 	// ufsecp_progress(scan_key) — returns scan progress percentage (0-100), or -1 if no scan active
-	ScalarFunction progress_func("ufsecp_progress", {LogicalType::BLOB}, LogicalType::DOUBLE,
-	                             [](DataChunk &args, ExpressionState &state, Vector &result) {
-		                             auto &key_vector = args.data[0];
-		                             auto key_val = key_vector.GetValue(0);
-		                             string_t key = StringValue::Get(key_val);
-		                             std::string scan_key(key.GetData(), key.GetSize());
+	ScalarFunction progress_func(
+	    "ufsecp_progress", {LogicalType::BLOB}, LogicalType::DOUBLE,
+	    [](DataChunk &args, ExpressionState &state, Vector &result) {
+		    auto &key_vector = args.data[0];
+		    auto key_val = key_vector.GetValue(0);
+		    string_t key = StringValue::Get(key_val);
+		    std::string scan_key(key.GetData(), key.GetSize());
 
-		                             double pct = -1.0;
-		                             {
-			                             std::lock_guard<std::mutex> lock(g_progress_mutex);
-			                             auto it = g_progress_map.find(scan_key);
-			                             if (it != g_progress_map.end()) {
-				                             auto &sp = it->second;
-				                             if (sp->complete) {
-					                             pct = 100.0;
-				                             } else {
-					                             uint64_t received = sp->rows_received.load();
-					                             uint64_t processed = sp->rows_processed.load();
-					                             if (received > 0) {
-						                             pct = static_cast<double>(processed) /
-						                                   static_cast<double>(received) * 100.0;
-						                             if (pct > 100.0)
-							                             pct = 100.0;
-					                             } else {
-						                             pct = 0.0;
-					                             }
-				                             }
-			                             }
-		                             }
-		                             result.SetValue(0, Value::DOUBLE(pct));
-		                             result.SetVectorType(VectorType::CONSTANT_VECTOR);
-	                             });
+		    double pct = -1.0;
+		    {
+			    std::lock_guard<std::mutex> lock(g_progress_mutex);
+			    auto it = g_progress_map.find(scan_key);
+			    if (it != g_progress_map.end()) {
+				    auto &sp = it->second;
+				    uint64_t received = sp->rows_received.load();
+				    uint64_t processed = sp->rows_processed.load();
+				    // Preferred path: caller passed total_rows on
+				    // ufsecp_scan, so we can report received/total
+				    // which advances per-input-chunk (smooth).
+				    if (sp->total_rows > 0) {
+					    pct = static_cast<double>(received) / static_cast<double>(sp->total_rows) * 100.0;
+					    if (pct > 100.0)
+						    pct = 100.0;
+				    }
+				    // Fallback: processed/received (granular — jumps in
+				    // batch_size increments). Used when caller didn't
+				    // supply total_rows.
+				    else if (received > 0) {
+					    pct = static_cast<double>(processed) / static_cast<double>(received) * 100.0;
+					    if (pct > 100.0)
+						    pct = 100.0;
+				    } else if (sp->complete) {
+					    pct = 100.0;
+				    } else {
+					    pct = 0.0;
+				    }
+			    }
+		    }
+		    result.SetValue(0, Value::DOUBLE(pct));
+		    result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	    });
 	progress_func.stability = FunctionStability::VOLATILE;
 	loader.RegisterFunction(progress_func);
 }
