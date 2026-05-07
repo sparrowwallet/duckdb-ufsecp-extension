@@ -240,8 +240,15 @@ struct UfsecpScanBindData : public TableFunctionData {
 	}
 	~UfsecpScanBindData() {
 		if (progress) {
+			// Only erase the map entry if it's still pointing at OUR ScanProgress.
+			// Concurrent scans with the same scan_key share a key in the map; we
+			// don't want to erase an entry that belongs to a peer scan. See the
+			// matching insertion logic in UfsecpScanBind.
 			std::lock_guard<std::mutex> lock(g_progress_mutex);
-			g_progress_map.erase(scan_private_key_data);
+			auto it = g_progress_map.find(scan_private_key_data);
+			if (it != g_progress_map.end() && it->second == progress) {
+				g_progress_map.erase(it);
+			}
 		}
 	}
 
@@ -890,12 +897,20 @@ static unique_ptr<FunctionData> UfsecpScanBind(ClientContext &context, TableFunc
 	bind_data->spend_public_key_data = std::string(spend_public_key.GetData(), spend_public_key.GetSize());
 	bind_data->label_keys_data = std::move(label_keys);
 
-	// Register progress entry for side-channel polling via ufsecp_progress()
+	// Register progress entry for side-channel polling via ufsecp_progress().
+	// If a scan with the same scan_key is already being tracked (callers may
+	// run concurrent scans that share a wallet's scan key, e.g. a long
+	// historical scan plus a short incremental), don't overwrite its entry —
+	// the existing scan keeps owning the progress slot until it ends. This
+	// scan still updates its own `progress` counters (they remain valid for
+	// the streaming function) but they're not exposed via ufsecp_progress()
+	// while a peer scan is in flight. The destructor's identity check ensures
+	// we only erase the map entry if it still points at our ScanProgress.
 	bind_data->progress = std::make_shared<ScanProgress>();
 	bind_data->progress->total_rows = bind_data->total_rows;
 	{
 		std::lock_guard<std::mutex> lock(g_progress_mutex);
-		g_progress_map[bind_data->scan_private_key_data] = bind_data->progress;
+		g_progress_map.try_emplace(bind_data->scan_private_key_data, bind_data->progress);
 	}
 
 	// Precompute KPlan from scan_private_key (LE wire → Scalar → KPlan)
