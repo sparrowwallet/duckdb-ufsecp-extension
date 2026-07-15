@@ -332,6 +332,12 @@ struct UfsecpScanLocalState : public LocalTableFunctionState {
 struct UfsecpScanState : public GlobalTableFunctionState {
 	UfsecpScanState() {
 	}
+
+	// Since DuckDB 1.5.1 (PR #19951), in/out function pipeline parallelism is capped by
+	// this value; the base class default of 1 forces single-threaded execution.
+	idx_t MaxThreads() const override {
+		return GlobalTableFunctionState::MAX_THREADS;
+	}
 };
 
 // ============================================================================
@@ -375,7 +381,6 @@ static void AccumulateInput(UfsecpScanLocalState &local_state, DataChunk &input)
 
 		if (txid_data.validity.RowIsValid(txid_idx) && height_data.validity.RowIsValid(height_idx) &&
 		    tweak_key_data.validity.RowIsValid(tweak_key_idx)) {
-
 			auto txid_str = txid_ptr[txid_idx];
 			auto tweak_key_str = tweak_key_ptr[tweak_key_idx];
 			local_state.accumulated_txids.push_back(std::string(txid_str.GetData(), txid_str.GetSize()));
