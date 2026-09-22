@@ -294,14 +294,27 @@ int UfsecpOclDetect(int *num_gpus) {
 						}
 					}
 					if (!g_use_fused) {
-						fprintf(stderr, "[OpenCL] Fused kernel unavailable, using multi-dispatch fallback\n");
+						// Do NOT fall back to the legacy multi-dispatch path: it has returned
+						// silently incorrect scan results (12.4% of matches) when reached this
+						// way. Report the OpenCL backend as unavailable instead, so backend
+						// selection falls through to the (correct) CPU path — or, for an
+						// explicit backend := 'gpu' request, fails loudly.
+						fprintf(stderr, "[OpenCL] Fused kernel unavailable — disabling OpenCL backend "
+						                "(scan would be incorrect on the multi-dispatch path)\n");
 						if (g_fused_program) {
 							clReleaseProgram(g_fused_program);
 							g_fused_program = nullptr;
 						}
+						g_ocl_device_count = 0;
 					}
 				}
 			}
+		}
+		// Safety net for any init path that leaves the fused kernel unavailable
+		// (null native context/queue/device): same rationale as above.
+		if (g_ocl_device_count > 0 && !g_use_fused) {
+			fprintf(stderr, "[OpenCL] Fused kernel unavailable — disabling OpenCL backend\n");
+			g_ocl_device_count = 0;
 		}
 		g_ocl_initialized = true;
 	}
