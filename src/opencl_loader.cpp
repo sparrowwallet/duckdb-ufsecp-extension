@@ -43,6 +43,8 @@ static cl_int (*r_clGetProgramBuildInfo)(cl_program, cl_device_id, cl_program_bu
 static cl_kernel (*r_clCreateKernel)(cl_program, const char *, cl_int *) = nullptr;
 static cl_int (*r_clReleaseKernel)(cl_kernel) = nullptr;
 static cl_int (*r_clSetKernelArg)(cl_kernel, cl_uint, size_t, const void *) = nullptr;
+static cl_int (*r_clGetKernelWorkGroupInfo)(cl_kernel, cl_device_id, cl_kernel_work_group_info, size_t, void *,
+                                            size_t *) = nullptr;
 static cl_int (*r_clEnqueueNDRangeKernel)(cl_command_queue, cl_kernel, cl_uint, const size_t *, const size_t *,
                                           const size_t *, cl_uint, const cl_event *, cl_event *) = nullptr;
 static cl_int (*r_clGetCommandQueueInfo)(cl_command_queue, cl_command_queue_info, size_t, void *, size_t *) = nullptr;
@@ -97,6 +99,7 @@ extern "C" bool opencl_loader_init(void) {
 	r_clCreateKernel = LOAD_SYM(handle, clCreateKernel);
 	r_clReleaseKernel = LOAD_SYM(handle, clReleaseKernel);
 	r_clSetKernelArg = LOAD_SYM(handle, clSetKernelArg);
+	r_clGetKernelWorkGroupInfo = LOAD_SYM(handle, clGetKernelWorkGroupInfo);
 	r_clEnqueueNDRangeKernel = LOAD_SYM(handle, clEnqueueNDRangeKernel);
 	r_clGetCommandQueueInfo = LOAD_SYM(handle, clGetCommandQueueInfo);
 	r_clGetPlatformInfo = LOAD_SYM(handle, clGetPlatformInfo);
@@ -251,6 +254,15 @@ CL_API_ENTRY cl_int CL_API_CALL clReleaseKernel(cl_kernel kernel) CL_API_SUFFIX_
 CL_API_ENTRY cl_int CL_API_CALL clSetKernelArg(cl_kernel kernel, cl_uint arg_index, size_t arg_size,
                                                const void *arg_value) CL_API_SUFFIX__VERSION_1_0 {
 	return r_clSetKernelArg ? r_clSetKernelArg(kernel, arg_index, arg_size, arg_value) : CL_INVALID_KERNEL;
+}
+
+CL_API_ENTRY cl_int CL_API_CALL clGetKernelWorkGroupInfo(cl_kernel kernel, cl_device_id device,
+                                                         cl_kernel_work_group_info param_name, size_t param_value_size,
+                                                         void *param_value,
+                                                         size_t *param_value_size_ret) CL_API_SUFFIX__VERSION_1_0 {
+	return r_clGetKernelWorkGroupInfo ? r_clGetKernelWorkGroupInfo(kernel, device, param_name, param_value_size,
+	                                                               param_value, param_value_size_ret)
+	                                  : CL_INVALID_KERNEL;
 }
 
 CL_API_ENTRY cl_int CL_API_CALL clEnqueueNDRangeKernel(cl_command_queue command_queue, cl_kernel kernel,
