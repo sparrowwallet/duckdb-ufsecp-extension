@@ -21,6 +21,11 @@ set(COMBINED "")
 # Prepend Metal stdlib
 string(APPEND COMBINED "#include <metal_stdlib>\nusing namespace metal;\n\n")
 
+# SECP256K1_METAL_SCAN_ONLY gates out the constant-time sign wrappers and kernels in
+# secp256k1_extended.h, whose ct_*_metal callees live in secp256k1_ct_sign.h (not
+# embedded here). Without it the metallib fails to link (upstream issue #335).
+string(APPEND COMBINED "#define SECP256K1_METAL_SCAN_ONLY 1\n\n")
+
 # Read and strip each shader file
 foreach(FILE ${SHADER_FILES})
     file(READ "${FILE}" CONTENT)

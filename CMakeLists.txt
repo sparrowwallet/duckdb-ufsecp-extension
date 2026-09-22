@@ -74,6 +74,8 @@ set(SECP256K1_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(SECP256K1_BUILD_CABI OFF CACHE BOOL "" FORCE)
 set(SECP256K1_BUILD_METAL OFF CACHE BOOL "" FORCE)
 set(SECP256K1_BUILD_ROCM OFF CACHE BOOL "" FORCE)
+set(SECP256K1_BUILD_JAVA OFF CACHE BOOL "" FORCE)
+set(SECP256K1_BUILD_ETHEREUM OFF CACHE BOOL "" FORCE)
 set(SECP256K1_INSTALL OFF CACHE BOOL "" FORCE)
 
 # Default to portable x86-64-v3 (AVX2/FMA/BMI2) on x86_64 unless overridden.
@@ -120,23 +122,23 @@ endif()
 add_subdirectory(UltrafastSecp256k1 EXCLUDE_FROM_ALL)
 
 include_directories(src/include)
-include_directories(UltrafastSecp256k1/cpu/include)
+include_directories(UltrafastSecp256k1/src/cpu/include)
 
 # --- Source files ---
 set(EXTENSION_SOURCES src/ufsecp_extension.cpp)
 if(UFSECP_ENABLE_CUDA)
     list(APPEND EXTENSION_SOURCES src/ufsecp_gpu.cu)
-    include_directories(UltrafastSecp256k1/cuda/include)
+    include_directories(UltrafastSecp256k1/src/cuda/include)
 endif()
 if(UFSECP_ENABLE_OPENCL)
     list(APPEND EXTENSION_SOURCES src/ufsecp_gpu_opencl.cpp src/opencl_loader.cpp)
     include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src)
-    include_directories(UltrafastSecp256k1/opencl/include)
+    include_directories(UltrafastSecp256k1/src/opencl/include)
     include_directories(UltrafastSecp256k1/include)
 endif()
 if(UFSECP_ENABLE_METAL)
     list(APPEND EXTENSION_SOURCES src/ufsecp_gpu_metal.mm)
-    include_directories(UltrafastSecp256k1/metal/include)
+    include_directories(UltrafastSecp256k1/src/metal/include)
     include_directories(UltrafastSecp256k1/include)
 endif()
 
@@ -188,7 +190,7 @@ endif()
 
 if(UFSECP_ENABLE_OPENCL)
     # Generate embedded fused kernel source header
-    set(OPENCL_KERNEL_DIR ${CMAKE_CURRENT_SOURCE_DIR}/UltrafastSecp256k1/opencl/kernels)
+    set(OPENCL_KERNEL_DIR ${CMAKE_CURRENT_SOURCE_DIR}/UltrafastSecp256k1/src/opencl/kernels)
     add_custom_command(
         OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/opencl_fused_kernel_source.h
         COMMAND ${CMAKE_COMMAND}
@@ -217,7 +219,7 @@ endif()
 
 if(UFSECP_ENABLE_METAL)
     # Generate embedded shader source header
-    set(METAL_SHADER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/UltrafastSecp256k1/metal/shaders)
+    set(METAL_SHADER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/UltrafastSecp256k1/src/metal/shaders)
     add_custom_command(
         OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/metal_shader_source.h
         COMMAND ${CMAKE_COMMAND}

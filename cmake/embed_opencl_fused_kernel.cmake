@@ -18,7 +18,11 @@ set(KERNEL_FILES
 )
 
 # Part 1: UltrafastSecp256k1 kernel files (stripped of includes/guards)
-set(UF_KERNELS "")
+#
+# SECP256K1_OPENCL_SCAN_ONLY leads the combined source: it gates out the constant-time
+# sign paths in secp256k1_extended.cl, whose #include lines this script strips, keeping
+# the embedded translation unit self-contained (upstream issue #415).
+set(UF_KERNELS "#define SECP256K1_OPENCL_SCAN_ONLY 1\n")
 
 foreach(FILE ${KERNEL_FILES})
     file(READ "${FILE}" CONTENT)
