@@ -63,6 +63,16 @@ jobs:
             choco install ninja
           fi
 
+      # DuckDB v1.5.5's variant_stats.hpp puts DUCKDB_API (__declspec(dllexport)) on two
+      # deleted overloads, which clang-cl rejects as a hard error (MSVC tolerates it).
+      # Upstream duckdb main has already removed the attribute from exactly these lines;
+      # this mirrors that fix until the pinned DuckDB contains it. Remove on the next
+      # DuckDB submodule bump.
+      - name: Patch duckdb variant_stats.hpp for clang-cl
+        if: ${{ startsWith(matrix.runner, 'windows') }}
+        shell: bash
+        run: sed -i '/= delete;/s/DUCKDB_API //' duckdb/src/include/duckdb/storage/statistics/variant_stats.hpp
+
       - name: Build extension (Windows)
         if: ${{ startsWith(matrix.runner, 'windows') }}
         shell: cmd
